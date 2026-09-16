@@ -8,6 +8,8 @@
 - **键盘可用**：`↑` `↓` 选择、`Enter` 执行、`Esc` 清空搜索
 - **可用性体检**：启动时用 `vscode.commands.getCommands()` 核对，当前环境里不存在的命令自动置灰并标注，不会"点了没反应"
 - **自动收录扩展键位**：读取已安装扩展声明的键位，搜索框为空时附在列表下方，方便直接抄命令 ID
+- **快捷键文件可手选**：你自定义的键位来自 `keybindings.json`，自动探测不准时（portable / 远程 / 机器上放了多份变体）可以手动指定读哪一个
+- **四种排序**：默认顺序 / 按点击次数 / 按名称 / 按来源分组（点击次数**只统计面板内点击**，快捷键不计，原因见下）
 
 ## 安装
 
@@ -34,10 +36,12 @@ code --install-extension quick-command-deck-0.1.0.vsix
 
 | 设置项 | 默认值 | 说明 |
 |---|---|---|
-| `quickCommandDeck.fontSize` | `16` | 面板字号（px） |
+| `quickCommandDeck.fontSize` | `14` | 面板字号（px） |
 | `quickCommandDeck.showKeys` | `true` | 是否显示每条命令的键位 |
 | `quickCommandDeck.dense` | `false` | 紧凑模式，减小行距与内边距 |
+| `quickCommandDeck.includeExtensionCommands` | `true` | 是否把扩展声明的键位也列进主列表 |
 | `quickCommandDeck.commands` | `[]` | 自定义命令清单，**留空则用内置的 36 条** |
+| `quickCommandDeck.keybindingsPath` | `""` | 手动指定要读的 `keybindings.json`，**留空 = 自动探测** |
 
 ### 自定义命令清单
 
@@ -55,6 +59,54 @@ code --install-extension quick-command-deck-0.1.0.vsix
 - `keys` 只用于显示提示，写不写都行；不写时会尝试用扩展声明的键位补上
 
 > 为什么键位要手写？VS Code **没有**公开 API 能查询"某个命令的默认键位"——默认键位表是编译进 bundle 的私有格式。所以内置清单里的键位是人工维护的，**它只影响显示，不影响执行**。
+
+### 手动指定快捷键文件
+
+面板里显示"你自定义的键位"时，扩展是**直接读 `keybindings.json` 文件**的（VS Code 同样没有 API 能读到"当前生效的键位"）。默认按下列顺序自动探测，**取第一个存在的**：
+
+1. 由扩展 `globalStorage` 路径上推的 `<User>\keybindings.json`（portable / 远程 / `--user-data-dir` 场景下准确）
+2. `%APPDATA%\Code\User\keybindings.json`
+3. `%APPDATA%\Code - Insiders\User\keybindings.json`
+4. `~/.config/Code/User/keybindings.json`
+5. `~/Library/Application Support/Code/User/keybindings.json`
+
+探测不准时（比如你在别处放了一份专用键位表）用命令覆盖：
+
+| 命令（命令面板） | 作用 |
+|---|---|
+| `Quick Command Deck: 选择快捷键文件（keybindings.json）` | 打开文件选择框，选中即写入设置并立即刷新 |
+| `Quick Command Deck: 恢复自动探测快捷键文件` | 清空设置，回到上面的自动探测 |
+
+也可以直接写设置（支持绝对路径、`file:///` URI、`~` 前缀）：
+
+```jsonc
+{
+  "quickCommandDeck.keybindingsPath": "C:\\Users\\你\\.vscode\\extras\\keybindings.latex.json"
+}
+```
+
+行为细节：
+
+- **手动指定优先**；若该文件不存在或路径不合法，会提示一次并**回退自动探测**（不会让面板突然丢掉所有键位）
+- 视图标题右侧的小字会显示当前在用哪个文件：`手动：xxx.json` / `xxx.json` / `未找到快捷键文件`
+- 解析时会去掉 `//` 注释与尾随逗号（JSONC），并忽略 `-command` 定向解绑；同一命令多条绑定时**取第一条**；`when` 条件**不参与**判断
+- **不会自动监听文件变化**：改完 `keybindings.json` 后按视图标题栏的刷新按钮（或 `Quick Command Deck: 刷新命令可用性`）即可，不必重载窗口
+
+## 排序与「点击次数」
+
+工具栏右上有 4 种排序，会记在 `globalState` 里（跨工作区保留）：
+
+| 排序 | 依据 |
+|---|---|
+| `默认顺序` | 内置/自定义清单的排列顺序，扩展命令按名称附在后面 |
+| `按点击次数` | 你在**本面板里点击**该行的累计次数，多的在前 |
+| `按名称` | 按显示名（`zh-Hans-CN` 规则）排序 |
+| `按来源分组` | 先内置、再按扩展显示名分段，组内按名称 |
+
+> ⚠️ **「点击次数」只统计你在面板里点击行**（行内悬停提示写作「面板内点击 N 次」）。
+> **用键盘快捷键执行命令不会被统计**，原因是：快捷键由 VS Code 的键位服务**在主线程直接执行**，扩展宿主完全不在链路上——公开 API 里没有"命令被执行"这类事件（`commands` 命名空间里没有 `onDidExecuteCommand`），也没有 API 能在运行时注册键位去拦截。
+> 所以：想让排序反映你的真实习惯，就多点几次面板；敲快捷键按多少次都不会计入。
+> （理论上可以给每个想统计的键做一个"转调命令"代理——键位指向扩展、扩展计数后再转调真实命令——但那样这些键就依赖本扩展，且每个键都要改一次 `keybindings.json`，暂未实现。）
 
 ## 内置命令（36 条）
 
@@ -82,8 +134,11 @@ code --install-extension quick-command-deck-0.1.0.vsix
 npm install
 npm run compile      # 编译到 out/
 npm run watch        # 增量编译
+npm run check        # compile + webview 内联脚本自检（改完 buildHtml 后先跑这个）
 npm run package      # 生成 .vsix
 ```
+
+> `npm run check` 会重新生成 webview 的 HTML、校验内联脚本语法，并检查模板内是否混入了会被外层模板字符串吃掉的反斜杠转义——这类错误 `tsc` 不会报，但会让面板整个白屏。**改完 `src/extension.ts` 里的 `buildHtml()` 一定要跑一次**，看到「结果：通过」再重载窗口。
 
 调试：用 VS Code 打开本目录，按 `F5` 启动「扩展开发主机」。
 

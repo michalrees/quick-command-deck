@@ -40,6 +40,16 @@
         "title": "刷新命令可用性",
         "category": "Quick Command Deck",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "quickCommandDeck.setKeybindingsFile",
+        "title": "选择快捷键文件（keybindings.json）",
+        "category": "Quick Command Deck"
+      },
+      {
+        "command": "quickCommandDeck.resetKeybindingsFile",
+        "title": "恢复自动探测快捷键文件",
+        "category": "Quick Command Deck"
       }
     ],
     "menus": {
@@ -94,6 +104,12 @@
           "default": true,
           "description": "是否把已安装扩展声明的键位也一起列进主列表（与内置清单自动去重）。关闭后只显示内置/自定义清单。"
         },
+        "quickCommandDeck.keybindingsPath": {
+          "type": "string",
+          "default": "",
+          "scope": "window",
+          "description": "手动指定要读取的 keybindings.json 绝对路径（留空 = 自动探测）。VS Code 没有 API 能读到当前生效的键位，本扩展只能直接读这个文件；自动探测在 portable / 远程 / 机器上放了多份 keybindings 变体时可能选错，可用命令「选择快捷键文件」或本项覆盖。支持 file:/// URI 与 ~ 前缀。"
+        },
         "quickCommandDeck.commands": {
           "type": "array",
           "description": "要显示的命令列表。留空则使用内置的常用命令；数组顺序即显示顺序。",
@@ -126,6 +142,7 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "check": "npm run compile && node tools/check-webview.js",
     "package": "vsce package"
   },
   "devDependencies": {

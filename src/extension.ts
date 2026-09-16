@@ -33,6 +33,61 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('quickCommandDeck.refresh', () => provider.refresh())
   );
 
+  // ── 手动指定 keybindings.json ──────────────────────────────────────
+  // VS Code 没有 API 能读到"当前生效的键位"，本扩展只能直接读文件；自动探测在
+  // portable / 远程 / 机器上放了多份 keybindings 变体时会选错，所以给一个手选入口。
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quickCommandDeck.setKeybindingsFile', async () => {
+      const current = readSettings().keybindingsPath;
+      const resolved = resolveKeybindingsFile(context, current);
+      const userDir = process.env.APPDATA ? path.join(process.env.APPDATA, 'Code', 'User') : '';
+      const defaultDir = resolved.file
+        ? path.dirname(resolved.file)
+        : userDir || path.dirname(context.globalStorageUri.fsPath);
+
+      const picked = await vscode.window.showOpenDialog({
+        canSelectMany: false,
+        canSelectFiles: true,
+        canSelectFolders: false,
+        openLabel: '使用这个文件',
+        title: '选择存快捷键的 keybindings.json',
+        defaultUri: vscode.Uri.file(defaultDir),
+        filters: { '快捷键文件 (JSON)': ['json'], '所有文件': ['*'] }
+      });
+      if (!picked || picked.length === 0) {
+        return; // 用户取消，不动设置
+      }
+
+      const file = picked[0].fsPath;
+      await vscode.workspace
+        .getConfiguration('quickCommandDeck')
+        .update('keybindingsPath', file, vscode.ConfigurationTarget.Global);
+
+      const read = readUserKeybindings(file);
+      if (read.error) {
+        vscode.window.showWarningMessage(`已指定 ${file}，但解析失败：${read.error}`);
+      } else {
+        vscode.window.showInformationMessage(
+          `快捷键文件已指定：${file}（${read.entries} 条记录，${read.map.size} 条可用绑定）`
+        );
+      }
+      provider.refresh();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quickCommandDeck.resetKeybindingsFile', async () => {
+      await vscode.workspace
+        .getConfiguration('quickCommandDeck')
+        .update('keybindingsPath', '', vscode.ConfigurationTarget.Global);
+      const auto = resolveKeybindingsFile(context, '');
+      vscode.window.showInformationMessage(
+        auto.file ? `已恢复自动探测：${auto.file}` : '已恢复自动探测，但没有找到 keybindings.json'
+      );
+      provider.refresh();
+    })
+  );
+
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('quickCommandDeck')) {
@@ -62,6 +117,8 @@ interface DeckSettings {
   dense: boolean;
   includeExtensions: boolean;
   userCommands: CommandItem[];
+  /** 手动指定的 keybindings.json；空字符串 = 自动探测 */
+  keybindingsPath: string;
 }
 
 function readSettings(): DeckSettings {
@@ -72,7 +129,8 @@ function readSettings(): DeckSettings {
     showKeys: cfg.get<boolean>('showKeys', true),
     dense: cfg.get<boolean>('dense', false),
     includeExtensions: cfg.get<boolean>('includeExtensionCommands', true),
-    userCommands: Array.isArray(raw) ? raw : []
+    userCommands: Array.isArray(raw) ? raw : [],
+    keybindingsPath: cfg.get<string>('keybindingsPath', '')
   };
 }
 
@@ -152,45 +210,131 @@ interface Contributions {
 }
 
 /**
- * 定位用户的 keybindings.json。
+ * 自动探测 keybindings.json 的候选路径，按优先级排列。
  *
  * 顺序：
  *   1. 由本扩展的 globalStorage 路径上推（<User>/globalStorage/<publisher>.<name>）
  *      —— 这样在 portable / 远程 / 自定义 --user-data-dir 场景下也准确
  *   2. 平台默认位置兜底
+ *
+ * 带上 from 只是为了出错时能说清楚"这个路径是怎么来的"。
  */
-function findUserKeybindingsPath(context: vscode.ExtensionContext): string | null {
-  const candidates: string[] = [];
+function autoKeybindingsCandidates(context: vscode.ExtensionContext): Array<{ file: string; from: string }> {
+  const out: Array<{ file: string; from: string }> = [];
+
   try {
     // context.globalStorageUri = file:///<User>/globalStorage/<publisher>.<name>
     const storageDir = context.globalStorageUri.fsPath.replace(/[\\/]+$/, '');
     const userDir = path.dirname(path.dirname(storageDir));
-    candidates.push(path.join(userDir, 'keybindings.json'));
+    out.push({ file: path.join(userDir, 'keybindings.json'), from: 'globalStorage 推导' });
   } catch {
     /* 推导失败就用下面的兜底 */
   }
 
   const appData = process.env.APPDATA;
   if (appData) {
-    candidates.push(path.join(appData, 'Code', 'User', 'keybindings.json'));
-    candidates.push(path.join(appData, 'Code - Insiders', 'User', 'keybindings.json'));
+    out.push({ file: path.join(appData, 'Code', 'User', 'keybindings.json'), from: 'APPDATA\\Code\\User' });
+    out.push({
+      file: path.join(appData, 'Code - Insiders', 'User', 'keybindings.json'),
+      from: 'APPDATA\\Code - Insiders\\User'
+    });
   }
   const home = process.env.HOME || process.env.USERPROFILE;
   if (home) {
-    candidates.push(path.join(home, '.config', 'Code', 'User', 'keybindings.json'));
-    candidates.push(path.join(home, 'Library', 'Application Support', 'Code', 'User', 'keybindings.json'));
+    out.push({ file: path.join(home, '.config', 'Code', 'User', 'keybindings.json'), from: '~/.config/Code/User' });
+    out.push({
+      file: path.join(home, 'Library', 'Application Support', 'Code', 'User', 'keybindings.json'),
+      from: '~/Library/Application Support/Code/User'
+    });
   }
+  return out;
+}
 
-  for (const c of candidates) {
+/**
+ * 把设置里填的路径规范化成绝对文件路径。
+ * 容忍：前后空白、外层引号、file:/// URI、~ 前缀。
+ * 空输入返回 { file: null }（表示"没填"）；填了但不可用则带上 problem 说明原因。
+ */
+function normalizeUserPath(input: string): { file: string | null; problem?: string } {
+  let raw = String(input ?? '')
+    .trim()
+    .replace(/^"(.*)"$/, '$1')
+    .replace(/^'(.*)'$/, '$1');
+  if (!raw) {
+    return { file: null };
+  }
+  if (/^file:\/\//i.test(raw)) {
     try {
-      if (fs.existsSync(c)) {
-        return c;
-      }
+      raw = vscode.Uri.parse(raw).fsPath;
     } catch {
-      /* 忽略不可访问的候选 */
+      return { file: null, problem: '看不懂这个 file:// 路径：' + input };
     }
   }
-  return null;
+  if (raw === '~' || raw.startsWith('~/') || raw.startsWith('~\\')) {
+    const home = process.env.USERPROFILE || process.env.HOME || '';
+    if (!home) {
+      return { file: null, problem: '路径里的 ~ 展不开（读不到 USERPROFILE / HOME）' };
+    }
+    raw = path.join(home, raw.slice(1));
+  }
+  if (!path.isAbsolute(raw)) {
+    return { file: null, problem: '必须是绝对路径（现在填的是：' + input + '）' };
+  }
+  return { file: path.normalize(raw) };
+}
+
+interface ResolvedKeybindings {
+  /** 实际要读取的文件；null = 一个都没找到 */
+  file: string | null;
+  /** manual = 设置里手动指定；auto = 自动探测命中；none = 都没找到 */
+  origin: 'manual' | 'auto' | 'none';
+  /** 手动指定的路径有问题时的说明（此时已回退到自动探测） */
+  problem?: string;
+}
+
+function firstExisting(context: vscode.ExtensionContext): { file: string; from: string } | undefined {
+  return autoKeybindingsCandidates(context).find((c) => {
+    try {
+      return fs.existsSync(c.file);
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * 决定这次读哪个 keybindings.json：
+ *   1. 设置 quickCommandDeck.keybindingsPath 手动指定（优先，可指向任意文件名/任意位置）
+ *   2. 自动探测的 5 个候选，取第一个存在的
+ *
+ * 手动指定的文件不存在（或路径本身不合法）时**回退自动探测**，并通过 problem
+ * 让上层提示一次 —— 宁可临时读自动探测到的那个文件，也不要让面板突然丢掉所有键位。
+ */
+function resolveKeybindingsFile(context: vscode.ExtensionContext, manualPath?: string): ResolvedKeybindings {
+  const manual = normalizeUserPath(manualPath ?? '');
+  if (manual.file || manual.problem) {
+    if (manual.file && fs.existsSync(manual.file)) {
+      return { file: manual.file, origin: 'manual' };
+    }
+    const auto = firstExisting(context);
+    return {
+      file: auto ? auto.file : null,
+      origin: auto ? 'auto' : 'none',
+      problem: manual.problem ?? '手动指定的快捷键文件不存在：' + manual.file
+    };
+  }
+
+  const auto = firstExisting(context);
+  return { file: auto ? auto.file : null, origin: auto ? 'auto' : 'none' };
+}
+
+/** 视图标题右侧那行小字：一眼看出现在读的是哪个文件 */
+function describeKeybindings(r: ResolvedKeybindings): string {
+  if (!r.file) {
+    return '未找到快捷键文件';
+  }
+  const base = path.basename(r.file);
+  return r.origin === 'manual' ? '手动：' + base : base;
 }
 
 /** 去掉 JSONC 的注释与尾随逗号，使其能被 JSON.parse 处理 */
@@ -255,21 +399,32 @@ interface UserKeybindingEntry {
   linux?: string;
 }
 
+interface UserKeybindingRead {
+  /** 命令 ID → 用户绑定键位 */
+  map: Map<string, string>;
+  /** 文件里的原始条目数（含解绑、平台覆盖、非法项） */
+  entries: number;
+  /** 读/解析失败的原因；成功时为 undefined */
+  error?: string;
+}
+
 /** 读取用户 keybindings.json，得到「命令 ID → 用户绑定键位」 */
-function readUserKeybindings(file: string | null): Map<string, string> {
+function readUserKeybindings(file: string | null): UserKeybindingRead {
   const map = new Map<string, string>();
   if (!file) {
-    return map;
+    return { map, entries: 0 };
   }
   let entries: UserKeybindingEntry[];
   try {
     const parsed = JSON.parse(stripJsonComments(fs.readFileSync(file, 'utf8')));
     if (!Array.isArray(parsed)) {
-      return map;
+      return { map, entries: 0, error: '文件顶层不是数组（keybindings.json 应该是一个 JSON 数组）' };
     }
     entries = parsed as UserKeybindingEntry[];
-  } catch {
-    return map;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    console.warn('[quick-command-deck] 解析快捷键文件失败：' + file + ' —— ' + detail);
+    return { map, entries: 0, error: detail };
   }
 
   const platformKey = process.platform === 'win32' ? 'win' : process.platform === 'darwin' ? 'mac' : 'linux';
@@ -287,20 +442,20 @@ function readUserKeybindings(file: string | null): Map<string, string> {
       map.set(e.command, prettyKey(key));
     }
   }
-  return map;
+  return { map, entries: entries.length };
 }
 
 /**
  * 汇总已安装扩展贡献的命令/键位/显示名，以及用户自定义键位。
  * 全部走公开数据（扩展 packageJSON + 用户 keybindings.json）。
  */
-function collectContributions(context: vscode.ExtensionContext): Contributions {
+function collectContributions(context: vscode.ExtensionContext, keybindingsFile: string | null): Contributions {
   const owners = new Map<string, string>();
   const namespaces = new Map<string, string>();
   const bareTitles = new Map<string, string>();
   const keys = new Map<string, string>();
   const extNames = new Map<string, string>();
-  const userKeys = readUserKeybindings(findUserKeybindingsPath(context));
+  const userKeys = readUserKeybindings(keybindingsFile).map;
 
   for (const ext of vscode.extensions.all) {
     const pkg = ext.packageJSON as
@@ -445,8 +600,19 @@ function nonce(): string {
 
 class CommandDeckViewProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | undefined;
+  /** 手动指定的快捷键文件出问题时只提示一次，避免每次 render 都弹 */
+  private notifiedKeybindingsProblem = '';
 
   constructor(private readonly context: vscode.ExtensionContext) {}
+
+  /** 手动指定的文件不存在/不合法时提醒一次（此时已回退自动探测） */
+  private warnKeybindingsProblem(problem?: string): void {
+    if (!problem || problem === this.notifiedKeybindingsProblem) {
+      return;
+    }
+    this.notifiedKeybindingsProblem = problem;
+    void vscode.window.showWarningMessage('Quick Command Deck：' + problem + '；已回退到自动探测。');
+  }
 
   public resolveWebviewView(webviewView: vscode.WebviewView): void {
     this.view = webviewView;
@@ -504,7 +670,7 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
     if (!this.view) {
       return;
     }
-    const { fontSize, showKeys, dense, includeExtensions, userCommands } = readSettings();
+    const { fontSize, showKeys, dense, includeExtensions, userCommands, keybindingsPath } = readSettings();
 
     let available: Set<string>;
     try {
@@ -513,7 +679,15 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
       available = new Set<string>();
     }
 
-    const con = collectContributions(this.context);
+    // 键位来源：手动指定的文件优先，其次是自动探测；出问题会提示一次并回退
+    const kb = resolveKeybindingsFile(this.context, keybindingsPath);
+    this.warnKeybindingsProblem(kb.problem);
+    if (this.view) {
+      this.view.description = describeKeybindings(kb);
+    }
+    console.log(`[quick-command-deck] 快捷键文件：${kb.file ?? '（未找到）'}（${kb.origin}）`);
+
+    const con = collectContributions(this.context, kb.file);
     const usage = this.usageMap();
 
     // 键位取值优先级：清单里显式写死的 > 用户自定义绑定 > 扩展声明的默认键位
@@ -658,6 +832,10 @@ function buildHtml(
   items: DeckItem[],
   opts: { fontSize: number; showKeys: boolean; dense: boolean; mode: SortMode; nonce: string }
 ): string {
+  // 这段 JSON 会被内联进 <script> 里，所以必须把 '<' 转义成 \u003c：
+  // 万一某个扩展的命令标题里带 "</script>"（或 "<!--"），HTML 解析器会提前
+  // 闭合脚本标签，整块脚本直接消失 —— 又是白屏。转义后 JS 解析出的字符串
+  // 与原文完全一致（\u003c 就是 '<'），只是不再能被 HTML 解析器看见。
   const payload = JSON.stringify({
     items: items.map((i) => ({
       n: String(i.label ?? ''),
@@ -669,7 +847,7 @@ function buildHtml(
     })),
     showKeys: !!opts.showKeys,
     sortMode: opts.mode
-  });
+  }).replace(/</g, '\\u003c');
 
   const csp = [
     "default-src 'none'",
@@ -864,11 +1042,16 @@ function buildHtml(
   const MODES = ['default', 'usage', 'alpha', 'source'];
   const MODE_LABEL = {
     default: '默认顺序',
-    usage: '按使用次数',
+    usage: '按点击次数',
     alpha: '按名称',
     source: '按来源分组'
   };
-  const SHORT = { default: '默认', usage: '常用', alpha: '名称', source: '来源' };
+  const SHORT = { default: '默认', usage: '点击', alpha: '名称', source: '来源' };
+  // ⚠️ 这里的"次数"只统计**在本面板里点击行**的次数。
+  //    用键盘快捷键执行命令时，命令由 VS Code 的键位服务在主线程直接执行，
+  //    扩展宿主收不到任何通知（公开 API 里没有"命令被执行"这类事件），所以数不到。
+  //    想统计按键只能把键位改指到扩展的转调命令上，属于可选改造，当前未实现。
+  const CLICK_ONLY = '只统计在本面板里点击行的次数；用键盘快捷键执行的命令不计入（VS Code 未提供相关 API）';
   let mode = DATA.sortMode || 'default';
 
   const q = document.getElementById('q');
@@ -877,6 +1060,9 @@ function buildHtml(
   const seg = document.getElementById('seg');
   const hint = document.getElementById('hint');
   const clearBtn = document.getElementById('clear');
+  // 悬停即可看到"只统计面板内点击"的完整说明
+  sortSel.title = '排序方式。' + CLICK_ONLY;
+  hint.title = CLICK_ONLY;
   let rows = [];
   let sel = 0;
 
@@ -898,7 +1084,7 @@ function buildHtml(
       const b = document.createElement('button');
       b.type = 'button';
       b.textContent = SHORT[m];
-      b.title = MODE_LABEL[m];
+      b.title = m === 'usage' ? MODE_LABEL[m] + '。' + CLICK_ONLY : MODE_LABEL[m];
       if (m === mode) b.className = 'on';
       b.addEventListener('click', function () { setMode(m); });
       seg.appendChild(b);
@@ -917,7 +1103,7 @@ function buildHtml(
       hint.style.color = hit === 0 ? '#e05252' : '';
       hint.style.opacity = '1';
     } else {
-      hint.textContent = mode === 'usage' ? ('已记录 ' + used + ' 条') : ('共 ' + total + ' 条');
+      hint.textContent = mode === 'usage' ? ('面板内点击 ' + used + ' 条') : ('共 ' + total + ' 条');
       hint.style.color = '';
       hint.style.opacity = '';
     }
@@ -962,7 +1148,7 @@ function buildHtml(
     btn.className = 'row' + (it.a ? '' : ' missing');
     btn.disabled = !it.a;
     btn.dataset.command = it.c;
-    btn.title = it.c + (it.a ? '' : '（当前不可用）') + (it.u ? '   已使用 ' + it.u + ' 次' : '');
+    btn.title = it.c + (it.a ? '' : '（当前不可用）') + (it.u ? '   面板内点击 ' + it.u + ' 次' : '');
 
     const label = document.createElement('span');
     label.className = 'label';
@@ -1074,11 +1260,20 @@ function buildHtml(
   });
 
   // 前端初始化兜底：任何异常都画在页面上，而不是留一片空白让人猜
+  //
+  // ⚠️ 这段脚本是「外层模板字符串里的字符串」：buildHtml() 返回的是模板字面量，
+  //    所以这里写下的任何反斜杠转义都会先被**外层**模板字符串消费掉一遍。
+  //    之前用「反斜杠 + n」表示换行，它被吃成了真正的换行，落到 webview 里就变成
+  //    一个跨行的单引号字符串，整段脚本抛 SyntaxError（浏览器只报
+  //    "Failed to execute 'write' on 'Document': Invalid or unexpected token"），
+  //    面板全白 —— 和正则里「反斜杠 + s」被吃掉是同一类事故。
+  //    结论：本块内一律不用反斜杠（连注释里也别写），
+  //    需要控制字符就用 String.fromCharCode()。
   function showFatal(msg) {
     try {
       const d = document.createElement('div');
       d.style.cssText = 'padding:10px;white-space:pre-wrap;font-family:monospace;font-size:12px;color:var(--vscode-foreground)';
-      d.textContent = 'Command Deck 前端初始化失败：\n' + msg;
+      d.textContent = 'Command Deck 前端初始化失败：' + String.fromCharCode(10) + msg;
       document.body.appendChild(d);
     } catch (e) {
       document.body.textContent = 'Command Deck 初始化失败: ' + msg;
