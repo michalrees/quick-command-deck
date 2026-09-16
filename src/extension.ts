@@ -1019,10 +1019,21 @@ function buildHtml(
     if (cur) cur.el.scrollIntoView({ block: 'nearest' });
   }
 
-  // 归一化：小写 + 去掉 "+" 周围空格 + 压掉所有空白。
-  // 这样 ctrl+shift+s / Ctrl + Shift + S / CTRL+SHIFT+S 都能互相匹配
+  // 归一化：小写 + 去掉加号周围空白 + 压掉所有空白。
+  // 这样 ctrl+shift+s、Ctrl + Shift + S、CTRL+SHIFT+S 都能互相匹配。
+  //
+  // 注意：这里刻意不使用任何正则。本脚本会被内联进 webview 的 HTML，
+  // 之前用的空白正则里的反斜杠在某一层被吞掉，结果变成非法的表达式，
+  // 整个脚本抛 SyntaxError，界面全空。改用 split/join 实现同样效果，
+  // 既不含反斜杠也不含正则，从根上杜绝这类转义事故。
   function norm(s) {
-    return String(s).toLowerCase().replace(/\s*\+\s*/g, '+').replace(/\s+/g, '');
+    const lower = String(s).toLowerCase();
+    const parts = lower.split('+');
+    for (let i = 0; i < parts.length; i++) {
+      parts[i] = parts[i].split(' ').join('');
+      parts[i] = parts[i].split(String.fromCharCode(9)).join('');
+    }
+    return parts.join('+');
   }
 
   function currentList() {
