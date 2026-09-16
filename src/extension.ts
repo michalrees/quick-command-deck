@@ -92,14 +92,16 @@ function collectExtensionContributions(): { titles: Map<string, string>; keys: M
       continue;
     }
 
+    // 只接受字符串：扩展的 packageJSON 是任意 JSON，title/command 可能是数字或对象，
+    // 直接塞进 Map 会让后面 String 之外的操作（如 localeCompare）出错。
     for (const c of contributes.commands ?? []) {
-      if (c?.command && c?.title && !titles.has(c.command)) {
+      if (typeof c?.command === 'string' && typeof c?.title === 'string' && !titles.has(c.command)) {
         titles.set(c.command, c.title);
       }
     }
 
     for (const kb of contributes.keybindings ?? []) {
-      if (kb?.command && kb?.key && !keys.has(kb.command)) {
+      if (typeof kb?.command === 'string' && typeof kb?.key === 'string' && !keys.has(kb.command)) {
         keys.set(kb.command, prettyKey(kb.key));
       }
     }
@@ -168,13 +170,18 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
 
     const { titles, keys } = collectExtensionContributions();
 
+    // 注意：用户设置里的 commands 是任意 JSON，label/command 有可能是 undefined 或非字符串，
+    //       这里一律用 String() 兜住，否则后面 sort 时 .localeCompare 会抛
+    //       "a.label.localeCompare is not a function"，导致整个 render 失败、视图空白。
     const base: CommandItem[] = userCommands.length > 0 ? userCommands : DEFAULT_COMMANDS;
-    const items: DeckItem[] = base.map((it) => ({
-      label: it.label,
-      command: it.command,
-      keys: it.keys ?? keys.get(it.command),
-      available: available.has(it.command)
-    }));
+    const items: DeckItem[] = base
+      .filter((it) => it && it.command)
+      .map((it) => ({
+        label: String(it.label ?? it.command),
+        command: String(it.command),
+        keys: it.keys ? String(it.keys) : keys.get(String(it.command)),
+        available: available.has(String(it.command))
+      }));
 
     // 扩展声明的键位并入主列表（与内置清单去重，仅保留当前可用、且不在清单里的）
     const known = new Set(items.map((i) => i.command));
@@ -185,22 +192,31 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
           continue;
         }
         extras.push({
-          label: titles.get(command) ?? command,
-          command,
-          keys: key,
+          label: String(titles.get(command) ?? command),
+          command: String(command),
+          keys: key ? String(key) : undefined,
           available: true,
           fromExtension: true
         });
       }
-      extras.sort((a, b) => a.label.localeCompare(b.label, 'zh-Hans-CN'));
+      extras.sort((a, b) => String(a.label).localeCompare(String(b.label), 'zh-Hans-CN'));
     }
 
-    this.view.webview.html = buildHtml(items, extras, {
-      fontSize,
-      showKeys,
-      dense,
-      nonce: nonce()
-    });
+    // 兜底：任何渲染异常都直接显示在视图里，而不是留下一片空白让人猜
+    try {
+      this.view.webview.html = buildHtml(items, extras, {
+        fontSize,
+        showKeys,
+        dense,
+        nonce: nonce()
+      });
+    } catch (err) {
+      const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      this.view.webview.html =
+        `<!DOCTYPE html><html><body style="font-family:var(--vscode-font-family);padding:10px;color:var(--vscode-foreground)">` +
+        `<b>Command Deck 渲染失败</b><pre style="white-space:pre-wrap">${escapeHtml(detail)}</pre></body></html>`;
+      console.error('[quick-command-deck] render failed:', err);
+    }
   }
 }
 
@@ -210,15 +226,16 @@ function buildHtml(
   opts: { fontSize: number; showKeys: boolean; dense: boolean; nonce: string }
 ): string {
   const all = items.concat(extras);
+  // 全部强制转字符串：payload 直接进脚本，任何非字符串都可能让前端崩
   const payload = JSON.stringify({
     items: all.map((i) => ({
-      n: i.label,
-      c: i.command,
-      k: i.keys ?? '',
-      a: i.available,
+      n: String(i.label ?? ''),
+      c: String(i.command ?? ''),
+      k: i.keys === undefined || i.keys === null ? '' : String(i.keys),
+      a: !!i.available,
       e: i.fromExtension ? 1 : 0
     })),
-    showKeys: opts.showKeys,
+    showKeys: !!opts.showKeys,
     extStart: extras.length > 0 ? items.length : -1
   });
 
