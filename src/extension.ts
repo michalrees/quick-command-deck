@@ -811,11 +811,17 @@ function buildHtml(
     if (cur) cur.el.scrollIntoView({ block: 'nearest' });
   }
 
+  // 归一化：小写 + 去掉 "+" 周围空格 + 压掉所有空白。
+  // 这样 ctrl+shift+s / Ctrl + Shift + S / CTRL+SHIFT+S 都能互相匹配
+  function norm(s) {
+    return String(s).toLowerCase().replace(/\s*\+\s*/g, '+').replace(/\s+/g, '');
+  }
+
   function currentList() {
-    const term = q.value.trim().toLowerCase();
+    const term = norm(q.value);
     if (!term) return DATA.items;
     return DATA.items.filter(function (it) {
-      return (it.n + ' ' + it.c + ' ' + (it.k || '')).toLowerCase().indexOf(term) >= 0;
+      return norm(it.n + ' ' + it.c + ' ' + (it.k || '')).indexOf(term) >= 0;
     });
   }
 
