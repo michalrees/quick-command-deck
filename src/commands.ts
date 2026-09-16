@@ -1,5 +1,3 @@
-import * as vscode from 'vscode';
-
 /**
  * 命令条目结构。
  *
@@ -65,62 +63,3 @@ export const DEFAULT_COMMANDS: CommandItem[] = [
   { label: '键盘快捷方式', command: 'workbench.action.openGlobalKeybindings', keys: 'Ctrl+K Ctrl+S' },
   { label: '新建窗口', command: 'workbench.action.newWindow', keys: 'Ctrl+Shift+N' }
 ];
-
-interface ExtensionKeybinding {
-  key?: string;
-  mac?: string;
-  command?: string;
-  when?: string;
-}
-
-/**
- * 收集已安装扩展自己声明的键位（走扩展公开的 packageJSON，稳定可用）。
- * 用途：让用户能看到自己装的扩展（GitLens / Claude Code / 等）贡献的键位，
- * 并可以把命令 ID 直接抄进 quickCommandDeck.commands。
- */
-export function collectExtensionKeybindings(): Map<string, string> {
-  const map = new Map<string, string>();
-  for (const ext of vscode.extensions.all) {
-    const pkg = ext.packageJSON as
-      | { contributes?: { keybindings?: ExtensionKeybinding[] } }
-      | undefined;
-    const list = pkg?.contributes?.keybindings;
-    if (!Array.isArray(list)) {
-      continue;
-    }
-    for (const kb of list) {
-      const command = kb?.command;
-      const key = kb?.key;
-      if (!command || !key) {
-        continue;
-      }
-      // 同一个命令可能有多条键位，保留第一条非和弦的（更易读）
-      if (!map.has(command)) {
-        map.set(command, prettyKey(key));
-      }
-    }
-  }
-  return map;
-}
-
-/** 把 VS Code 的键位字符串变得好读一点：ctrl+shift+p → Ctrl+Shift+P */
-export function prettyKey(key: string): string {
-  return key
-    .split(' ')
-    .map((chord) =>
-      chord
-        .split('+')
-        .map((part) => {
-          const p = part.trim();
-          if (p.length === 1) {
-            return p.toUpperCase();
-          }
-          if (/^f\d{1,2}$/i.test(p)) {
-            return p.toUpperCase();
-          }
-          return p.charAt(0).toUpperCase() + p.slice(1);
-        })
-        .join('+')
-    )
-    .join(' ');
-}

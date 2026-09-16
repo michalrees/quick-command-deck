@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { DEFAULT_COMMANDS, CommandItem, collectExtensionKeybindings, prettyKey } from './commands';
+import { DEFAULT_COMMANDS, CommandItem } from './commands';
 
 /** 面板视图 ID（与 package.json 里的 views 贡献保持一致） */
 const VIEW_ID = 'quickCommandDeck.view';
@@ -56,7 +56,7 @@ function readSettings(): DeckSettings {
   const cfg = vscode.workspace.getConfiguration('quickCommandDeck');
   const raw = cfg.get<CommandItem[]>('commands', []);
   return {
-    fontSize: cfg.get<number>('fontSize', 16),
+    fontSize: cfg.get<number>('fontSize', 15),
     showKeys: cfg.get<boolean>('showKeys', true),
     dense: cfg.get<boolean>('dense', false),
     includeExtensions: cfg.get<boolean>('includeExtensionCommands', true),
@@ -67,12 +67,33 @@ function readSettings(): DeckSettings {
 interface ExtensionContribution {
   key?: string;
   command?: string;
-  title?: string;
+}
+
+/** 把 ctrl+shift+p 这类键位字符串变得好读：Ctrl+Shift+P */
+function prettyKey(key: string): string {
+  return key
+    .split(' ')
+    .map((chord) =>
+      chord
+        .split('+')
+        .map((part) => {
+          const p = part.trim();
+          if (p.length === 1) {
+            return p.toUpperCase();
+          }
+          if (/^f\d{1,2}$/i.test(p)) {
+            return p.toUpperCase();
+          }
+          return p.charAt(0).toUpperCase() + p.slice(1);
+        })
+        .join('+')
+    )
+    .join(' ');
 }
 
 /**
  * 收集已安装扩展贡献的：命令标题 + 键位。
- * 走的是扩展公开的 packageJSON（稳定可用），不依赖任何私有实现。
+ * 走扩展公开的 packageJSON，不依赖任何私有实现。
  */
 function collectExtensionContributions(): { titles: Map<string, string>; keys: Map<string, string> } {
   const titles = new Map<string, string>();
@@ -92,8 +113,7 @@ function collectExtensionContributions(): { titles: Map<string, string>; keys: M
       continue;
     }
 
-    // 只接受字符串：扩展的 packageJSON 是任意 JSON，title/command 可能是数字或对象，
-    // 直接塞进 Map 会让后面 String 之外的操作（如 localeCompare）出错。
+    // 只接受字符串：packageJSON 是任意 JSON，title/command 可能是数字或对象
     for (const c of contributes.commands ?? []) {
       if (typeof c?.command === 'string' && typeof c?.title === 'string' && !titles.has(c.command)) {
         titles.set(c.command, c.title);
@@ -170,11 +190,10 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
 
     const { titles, keys } = collectExtensionContributions();
 
-    // 注意：用户设置里的 commands 是任意 JSON，label/command 有可能是 undefined 或非字符串，
-    //       这里一律用 String() 兜住，否则后面 sort 时 .localeCompare 会抛
-    //       "a.label.localeCompare is not a function"，导致整个 render 失败、视图空白。
+    // 设置里的 commands 是任意 JSON，label/command 可能是 undefined 或非字符串，
+    // 一律 String() 兜住，避免后续比较/排序抛异常
     const base: CommandItem[] = userCommands.length > 0 ? userCommands : DEFAULT_COMMANDS;
-    const items: DeckItem[] = base
+    const curated: DeckItem[] = base
       .filter((it) => it && it.command)
       .map((it) => ({
         label: String(it.label ?? it.command),
@@ -183,12 +202,11 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
         available: available.has(String(it.command))
       }));
 
-    // 扩展声明的键位并入主列表（与内置清单去重，仅保留当前可用、且不在清单里的）
-    const known = new Set(items.map((i) => i.command));
+    // 扩展声明的键位
     const extras: DeckItem[] = [];
     if (includeExtensions) {
       for (const [command, key] of keys) {
-        if (known.has(command) || !available.has(command)) {
+        if (!available.has(command)) {
           continue;
         }
         extras.push({
@@ -202,9 +220,33 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
       extras.sort((a, b) => String(a.label).localeCompare(String(b.label), 'zh-Hans-CN'));
     }
 
-    // 兜底：任何渲染异常都直接显示在视图里，而不是留下一片空白让人猜
+    // ── 双向去重，解决"重复键位" ─────────────────────────────────────────
+    // ① 命令 ID 重复：内置清单与扩展声明常指向同一命令 → 保留先出现的（内置优先）
+    // ② 键位重复：不同扩展声明同一键位 → 只保留第一个
+    //    （键位相同的命令按下去效果一样，列两遍纯干扰）
+    const seenCommands = new Set<string>();
+    const seenKeys = new Set<string>();
+    const merged: DeckItem[] = [];
+    for (const it of [...curated, ...extras]) {
+      const cmd = String(it.command);
+      if (seenCommands.has(cmd)) {
+        continue;
+      }
+      const kb = it.keys ? String(it.keys) : '';
+      if (kb) {
+        const norm = kb.toLowerCase().replace(/\s+/g, ' ').trim();
+        if (seenKeys.has(norm)) {
+          continue;
+        }
+        seenKeys.add(norm);
+      }
+      seenCommands.add(cmd);
+      merged.push(it);
+    }
+
+    // 兜底：渲染异常直接显示在视图里，而不是留一片空白
     try {
-      this.view.webview.html = buildHtml(items, extras, {
+      this.view.webview.html = buildHtml(merged, {
         fontSize,
         showKeys,
         dense,
@@ -222,21 +264,17 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
 
 function buildHtml(
   items: DeckItem[],
-  extras: DeckItem[],
   opts: { fontSize: number; showKeys: boolean; dense: boolean; nonce: string }
 ): string {
-  const all = items.concat(extras);
-  // 全部强制转字符串：payload 直接进脚本，任何非字符串都可能让前端崩
   const payload = JSON.stringify({
-    items: all.map((i) => ({
+    items: items.map((i) => ({
       n: String(i.label ?? ''),
       c: String(i.command ?? ''),
       k: i.keys === undefined || i.keys === null ? '' : String(i.keys),
       a: !!i.available,
       e: i.fromExtension ? 1 : 0
     })),
-    showKeys: !!opts.showKeys,
-    extStart: extras.length > 0 ? items.length : -1
+    showKeys: !!opts.showKeys
   });
 
   const csp = [
@@ -299,7 +337,7 @@ function buildHtml(
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 10px;
+    gap: 8px;
     padding: var(--deck-pady) var(--deck-padx);
     border: 1px solid transparent;
     border-radius: 4px;
@@ -317,8 +355,32 @@ function buildHtml(
     border-color: var(--vscode-focusBorder, transparent);
   }
   .row .label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .row .dict { flex: 0 0 auto; font-size: .82em; opacity: .7; white-space: nowrap; }
   .row.missing { opacity: .45; cursor: not-allowed; }
+
+  /* ── 键位：每个键一个框（仿 VS Code 自身的按键提示样式）── */
+  .keys {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    white-space: nowrap;
+  }
+  .key {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.35em;
+    padding: 1px 5px;
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: .82em;
+    line-height: 1.5;
+    color: var(--vscode-keybindingLabel-foreground, var(--vscode-foreground));
+    background: var(--vscode-keybindingLabel-background, rgba(128,128,128,.14));
+    border: 1px solid var(--vscode-keybindingLabel-border, rgba(128,128,128,.45));
+    border-bottom-color: var(--vscode-keybindingLabel-bottomBorder, rgba(128,128,128,.7));
+    border-radius: 4px;
+  }
+  .plus { font-size: .8em; opacity: .55; }
   .sep {
     margin: 9px 4px 1px 4px;
     padding-top: 6px;
@@ -345,6 +407,36 @@ function buildHtml(
   let rows = [];
   let sel = 0;
 
+  // 把 "Ctrl+Shift+P" 渲染成 [Ctrl][+][Shift][+][P]
+  // 和弦 "Ctrl+K Ctrl+S" 渲染成 [Ctrl][+][K] 空格 [Ctrl][+][S]
+  function buildKeys(text) {
+    const wrap = document.createElement('span');
+    wrap.className = 'keys';
+    const chords = String(text).split(' ');
+    chords.forEach(function (chord, ci) {
+      if (ci > 0) {
+        const sp = document.createElement('span');
+        sp.className = 'plus';
+        sp.textContent = ' ';
+        wrap.appendChild(sp);
+      }
+      const parts = chord.split('+');
+      parts.forEach(function (p, pi) {
+        if (pi > 0) {
+          const plus = document.createElement('span');
+          plus.className = 'plus';
+          plus.textContent = '+';
+          wrap.appendChild(plus);
+        }
+        const k = document.createElement('span');
+        k.className = 'key';
+        k.textContent = p;
+        wrap.appendChild(k);
+      });
+    });
+    return wrap;
+  }
+
   function makeRow(it) {
     const btn = document.createElement('button');
     btn.className = 'row' + (it.a ? '' : ' missing');
@@ -358,25 +450,24 @@ function buildHtml(
     btn.appendChild(label);
 
     if (SHOW_KEYS && it.k) {
-      const k = document.createElement('span');
-      k.className = 'dict';
-      k.textContent = it.k;
-      btn.appendChild(k);
+      btn.appendChild(buildKeys(it.k));
     }
 
     btn.addEventListener('click', function () { fire(it); });
     return btn;
   }
 
-  function render(items, sepAt) {
+  function render(items) {
     list.textContent = '';
     rows = [];
-    items.forEach(function (it, idx) {
-      if (sepAt >= 0 && idx === sepAt) {
+    let sepShown = false;
+    items.forEach(function (it) {
+      if (it.e && !sepShown) {
         const sep = document.createElement('div');
         sep.className = 'sep';
         sep.textContent = '来自已安装扩展';
         list.appendChild(sep);
+        sepShown = true;
       }
       const btn = makeRow(it);
       list.appendChild(btn);
@@ -407,13 +498,12 @@ function buildHtml(
   function filter() {
     const term = q.value.trim().toLowerCase();
     if (!term) {
-      render(DATA.items, DATA.extStart);
+      render(DATA.items);
       return;
     }
-    const hit = DATA.items.filter(function (it) {
+    render(DATA.items.filter(function (it) {
       return (it.n + ' ' + it.c + ' ' + (it.k || '')).toLowerCase().indexOf(term) >= 0;
-    });
-    render(hit, -1);
+    }));
   }
 
   q.addEventListener('input', filter);
@@ -431,7 +521,7 @@ function buildHtml(
     }
   });
 
-  render(DATA.items, DATA.extStart);
+  render(DATA.items);
   q.focus();
 </script>
 </body>
