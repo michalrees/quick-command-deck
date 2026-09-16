@@ -143,22 +143,164 @@ interface Contributions {
   namespaces: Map<string, string>;
   /** 命令 ID → 标题（去掉"扩展名: "前缀后的裸标题） */
   bareTitles: Map<string, string>;
-  /** 命令 ID → 键位 */
+  /** 命令 ID → 扩展声明的默认键位 */
   keys: Map<string, string>;
   /** 扩展 ID（小写）→ 显示名，用于按命名空间反查来源 */
   extNames: Map<string, string>;
+  /** 命令 ID → 用户自己在 keybindings.json 里绑的键位 */
+  userKeys: Map<string, string>;
 }
 
 /**
- * 汇总已安装扩展贡献的命令/键位/显示名。
- * 全部走公开的 packageJSON，不依赖任何私有实现。
+ * 定位用户的 keybindings.json。
+ *
+ * 顺序：
+ *   1. 由本扩展的 globalStorage 路径上推（<User>/globalStorage/<publisher>.<name>）
+ *      —— 这样在 portable / 远程 / 自定义 --user-data-dir 场景下也准确
+ *   2. 平台默认位置兜底
  */
-function collectContributions(): Contributions {
+function findUserKeybindingsPath(context: vscode.ExtensionContext): string | null {
+  const candidates: string[] = [];
+  try {
+    // context.globalStorageUri = file:///<User>/globalStorage/<publisher>.<name>
+    const storageDir = context.globalStorageUri.fsPath.replace(/[\\/]+$/, '');
+    const userDir = path.dirname(path.dirname(storageDir));
+    candidates.push(path.join(userDir, 'keybindings.json'));
+  } catch {
+    /* 推导失败就用下面的兜底 */
+  }
+
+  const appData = process.env.APPDATA;
+  if (appData) {
+    candidates.push(path.join(appData, 'Code', 'User', 'keybindings.json'));
+    candidates.push(path.join(appData, 'Code - Insiders', 'User', 'keybindings.json'));
+  }
+  const home = process.env.HOME || process.env.USERPROFILE;
+  if (home) {
+    candidates.push(path.join(home, '.config', 'Code', 'User', 'keybindings.json'));
+    candidates.push(path.join(home, 'Library', 'Application Support', 'Code', 'User', 'keybindings.json'));
+  }
+
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c)) {
+        return c;
+      }
+    } catch {
+      /* 忽略不可访问的候选 */
+    }
+  }
+  return null;
+}
+
+/** 去掉 JSONC 的注释与尾随逗号，使其能被 JSON.parse 处理 */
+function stripJsonComments(text: string): string {
+  let out = '';
+  let inString = false;
+  let inLine = false;
+  let inBlock = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (inLine) {
+      if (ch === '\n') {
+        inLine = false;
+        out += ch;
+      }
+      continue;
+    }
+    if (inBlock) {
+      if (ch === '*' && next === '/') {
+        inBlock = false;
+        i++;
+      }
+      continue;
+    }
+    if (inString) {
+      out += ch;
+      if (ch === '\\') {
+        out += next ?? '';
+        i++;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === '/' && next === '/') {
+      inLine = true;
+      i++;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      inBlock = true;
+      i++;
+      continue;
+    }
+    out += ch;
+  }
+  // 尾随逗号
+  return out.replace(/,(\s*[}\]])/g, '$1');
+}
+
+interface UserKeybindingEntry {
+  key?: string;
+  command?: string;
+  win?: string;
+  mac?: string;
+  linux?: string;
+}
+
+/** 读取用户 keybindings.json，得到「命令 ID → 用户绑定键位」 */
+function readUserKeybindings(file: string | null): Map<string, string> {
+  const map = new Map<string, string>();
+  if (!file) {
+    return map;
+  }
+  let entries: UserKeybindingEntry[];
+  try {
+    const parsed = JSON.parse(stripJsonComments(fs.readFileSync(file, 'utf8')));
+    if (!Array.isArray(parsed)) {
+      return map;
+    }
+    entries = parsed as UserKeybindingEntry[];
+  } catch {
+    return map;
+  }
+
+  const platformKey = process.platform === 'win32' ? 'win' : process.platform === 'darwin' ? 'mac' : 'linux';
+  for (const e of entries) {
+    if (!e || typeof e.command !== 'string' || typeof e.key !== 'string') {
+      continue;
+    }
+    // 负号是"解绑"，不是绑定
+    if (e.command.startsWith('-')) {
+      continue;
+    }
+    const override = e[platformKey as keyof UserKeybindingEntry];
+    const key = typeof override === 'string' && override ? override : e.key;
+    if (!map.has(e.command)) {
+      map.set(e.command, prettyKey(key));
+    }
+  }
+  return map;
+}
+
+/**
+ * 汇总已安装扩展贡献的命令/键位/显示名，以及用户自定义键位。
+ * 全部走公开数据（扩展 packageJSON + 用户 keybindings.json）。
+ */
+function collectContributions(context: vscode.ExtensionContext): Contributions {
   const owners = new Map<string, string>();
   const namespaces = new Map<string, string>();
   const bareTitles = new Map<string, string>();
   const keys = new Map<string, string>();
   const extNames = new Map<string, string>();
+  const userKeys = readUserKeybindings(findUserKeybindingsPath(context));
 
   for (const ext of vscode.extensions.all) {
     const pkg = ext.packageJSON as
@@ -223,7 +365,7 @@ function collectContributions(): Contributions {
     }
   }
 
-  return { owners, namespaces, bareTitles, keys, extNames };
+  return { owners, namespaces, bareTitles, keys, extNames, userKeys };
 }
 
 /** 标题里形如 %some.key% 的是扩展的本地化 key（未解析） */
@@ -371,8 +513,12 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
       available = new Set<string>();
     }
 
-    const con = collectContributions();
+    const con = collectContributions(this.context);
     const usage = this.usageMap();
+
+    // 键位取值优先级：清单里显式写死的 > 用户自定义绑定 > 扩展声明的默认键位
+    const keyOf = (command: string, explicit?: string): string | undefined =>
+      explicit ? String(explicit) : con.userKeys.get(command) ?? con.keys.get(command);
 
     // 设置里的 commands 是任意 JSON，label/command 可能是 undefined 或非字符串，
     // 一律 String() 兜住，避免后续比较/排序抛异常
@@ -382,27 +528,30 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
       .map((it) => ({
         label: String(it.label ?? it.command),
         command: String(it.command),
-        keys: it.keys ? String(it.keys) : con.keys.get(String(it.command)),
+        keys: keyOf(String(it.command), it.keys),
         available: available.has(String(it.command))
       }));
 
-    // ── 扩展命令：名字带"扩展显示名:"前缀（用户选定），无正式标题则按 ID 可读化 ──
+    // ── 扩展命令：名字带"扩展显示名:"前缀，无正式标题则按 ID 可读化 ──
+    // 迭代 con.keys 与 con.userKeys 的并集：有些命令只有你自定义的键位、扩展没声明
     const extras: DeckItem[] = [];
     if (includeExtensions) {
-      for (const [command, key] of con.keys) {
+      const candidates = new Set<string>([...con.keys.keys(), ...con.userKeys.keys()]);
+      for (const command of candidates) {
         // 只列"由某个扩展真正声明"的命令；只声明键位的不算，
         // 否则会把内置命令（如 workbench.view.scm）也当成扩展命令收进来
         if (!available.has(command) || !con.owners.has(command)) {
           continue;
         }
         const source = con.owners.get(command) ?? '';
-        const bare = con.bareTitles.get(command) ?? humanizeCommandId(command, con.namespaces.get(command));
+        const bare =
+          con.bareTitles.get(command) ?? humanizeCommandId(command, con.namespaces.get(command));
         extras.push({
           label: source ? `${source}: ${bare}` : bare,
           bare,
           source,
           command: String(command),
-          keys: key ? String(key) : undefined,
+          keys: keyOf(command),
           available: true
         });
       }
@@ -411,9 +560,10 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
 
     // ── 双向去重（内置清单优先）────────────────────────────────────────
     // ① 命令 ID 相同 → 保留内置那条
-    // ② 键位相同 → 只保留第一个
+    // ② 键位相同 → 只保留第一个；但若某项是你"自定义绑定"的键位，则它优先，
+    //    已有的同键位条目让位（否则你把某命令绑到已被占用的键上时会看不到它）
     const seenCommands = new Set<string>();
-    const seenKeys = new Set<string>();
+    const seenKeys = new Map<string, number>();
     const merged: DeckItem[] = [];
     for (const it of [...curated, ...extras]) {
       const cmd = String(it.command);
@@ -421,12 +571,18 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
         continue;
       }
       const kb = it.keys ? String(it.keys) : '';
-      if (kb) {
-        const norm = kb.toLowerCase().replace(/\s+/g, ' ').trim();
-        if (seenKeys.has(norm)) {
-          continue;
+      const norm = kb ? kb.toLowerCase().replace(/\s+/g, ' ').trim() : '';
+      const isUserBound = con.userKeys.has(cmd);
+      if (norm && seenKeys.has(norm) && !isUserBound) {
+        continue;
+      }
+      if (norm) {
+        const prevIdx = seenKeys.get(norm);
+        if (prevIdx !== undefined && isUserBound) {
+          merged.splice(prevIdx, 1); // 让位给你的自定义绑定
+          seenKeys.delete(norm);
         }
-        seenKeys.add(norm);
+        seenKeys.set(norm, merged.length);
       }
       seenCommands.add(cmd);
       merged.push(it);
