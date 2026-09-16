@@ -803,19 +803,22 @@ function buildHtml(
   .row.missing { opacity: .45; cursor: not-allowed; }
 
   .keys { flex: 0 0 auto; display: flex; align-items: center; gap: 3px; white-space: nowrap; }
+  /* 键位方框：不再使用 --vscode-keybindingLabel-* 变量。
+     实测某些主题下这些变量未定义/被渲染成透明，导致"方框在但看不见"。
+     这里改用中性灰度 + color-mix 自动适配深浅色，保证任何主题下都可见。 */
   .key {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     min-width: 1.35em;
     padding: 1px 5px;
-    font-family: var(--vscode-editor-font-family, monospace);
+    font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
     font-size: .82em;
     line-height: 1.5;
-    color: var(--vscode-keybindingLabel-foreground, var(--vscode-foreground));
-    background: var(--vscode-keybindingLabel-background, rgba(128,128,128,.14));
-    border: 1px solid var(--vscode-keybindingLabel-border, rgba(128,128,128,.45));
-    border-bottom-color: var(--vscode-keybindingLabel-bottomBorder, rgba(128,128,128,.7));
+    color: var(--vscode-foreground);
+    background: rgba(127, 127, 127, 0.18);
+    border: 1px solid rgba(127, 127, 127, 0.65);
+    border-bottom-width: 2px;
     border-radius: 4px;
   }
   .plus { font-size: .8em; opacity: .55; }
@@ -894,9 +897,24 @@ function buildHtml(
       b.addEventListener('click', function () { setMode(m); });
       seg.appendChild(b);
     });
+    updateHint();
+  }
+
+  // 状态栏文字：始终反映"当前命中数 / 总数"，搜索时高亮提示，避免误以为列表坏了
+  function updateHint() {
+    const total = DATA.items.length;
     const used = DATA.items.filter(function (i) { return (i.u || 0) > 0; }).length;
-    // 始终显示总条数，便于判断"空列表"是数据为空还是搜索过滤掉了
-    hint.textContent = mode === 'usage' ? ('已记录 ' + used + ' 条') : ('共 ' + DATA.items.length + ' 条');
+    const term = q.value.trim();
+    if (term) {
+      const hit = currentList().length;
+      hint.textContent = '命中 ' + hit + ' / 共 ' + total + ' 条';
+      hint.style.color = hit === 0 ? '#e05252' : '';
+      hint.style.opacity = '1';
+    } else {
+      hint.textContent = mode === 'usage' ? ('已记录 ' + used + ' 条') : ('共 ' + total + ' 条');
+      hint.style.color = '';
+      hint.style.opacity = '';
+    }
   }
 
   function setMode(m) {
@@ -976,7 +994,7 @@ function buildHtml(
       const term = q.value.trim();
       d.textContent = DATA.items.length === 0
         ? '命令列表为空（扩展没取到任何命令，请查看扩展宿主日志）'
-        : ('没有匹配「' + term + '」的命令（共 ' + DATA.items.length + ' 条，可点 × 清空搜索）');
+        : ('没有匹配「' + term + '」的命令。共 ' + DATA.items.length + ' 条，当前搜索框里有内容 —— 点搜索框右侧的 × 或按 Esc 清空即可看到全部。');
       list.appendChild(d);
     }
     select(0);
@@ -1011,6 +1029,7 @@ function buildHtml(
 
   function redraw() {
     updateClearBtn();
+    updateHint();
     render(currentList(), mode === 'source' && !q.value.trim());
   }
 
