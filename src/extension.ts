@@ -753,6 +753,23 @@ function buildHtml(
   }
   .hint { font-size: .78em; opacity: .55; margin-left: auto; }
 
+  /* 搜索行：输入框 + 清空按钮 */
+  .searchrow { display: flex; align-items: center; gap: 4px; }
+  .searchrow #q { flex: 1 1 auto; }
+  .clearbtn {
+    flex: 0 0 auto;
+    font: inherit;
+    line-height: 1;
+    padding: 3px 7px;
+    color: var(--vscode-foreground);
+    background: transparent;
+    border: 1px solid var(--vscode-panel-border, rgba(128,128,128,.4));
+    border-radius: 4px;
+    cursor: pointer;
+    opacity: .7;
+  }
+  .clearbtn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.18)); opacity: 1; }
+
   .list {
     flex: 1 1 auto;
     overflow-y: auto;
@@ -818,7 +835,10 @@ function buildHtml(
 </head>
 <body>
   <div class="toolbar">
-    <input id="q" type="text" placeholder="搜索命令或键位…" autocomplete="off" spellcheck="false" />
+    <div class="searchrow">
+      <input id="q" type="text" placeholder="搜索命令或键位…" autocomplete="off" spellcheck="false" />
+      <button class="clearbtn" id="clear" type="button" title="清空搜索">×</button>
+    </div>
     <div class="sortrow">
       <select id="sortsel" title="排序方式"></select>
       <div class="seg" id="seg"></div>
@@ -847,9 +867,13 @@ function buildHtml(
   const sortSel = document.getElementById('sortsel');
   const seg = document.getElementById('seg');
   const hint = document.getElementById('hint');
+  const clearBtn = document.getElementById('clear');
   let rows = [];
   let sel = 0;
-  let showGroups = false;
+
+  function updateClearBtn() {
+    clearBtn.style.display = q.value ? '' : 'none';
+  }
 
   function buildSortUi() {
     sortSel.textContent = '';
@@ -871,7 +895,8 @@ function buildHtml(
       seg.appendChild(b);
     });
     const used = DATA.items.filter(function (i) { return (i.u || 0) > 0; }).length;
-    hint.textContent = mode === 'usage' ? ('已记录 ' + used + ' 条') : '';
+    // 始终显示总条数，便于判断"空列表"是数据为空还是搜索过滤掉了
+    hint.textContent = mode === 'usage' ? ('已记录 ' + used + ' 条') : ('共 ' + DATA.items.length + ' 条');
   }
 
   function setMode(m) {
@@ -948,7 +973,10 @@ function buildHtml(
     if (rows.length === 0) {
       const d = document.createElement('div');
       d.className = 'empty';
-      d.textContent = '没有匹配的命令';
+      const term = q.value.trim();
+      d.textContent = DATA.items.length === 0
+        ? '命令列表为空（扩展没取到任何命令，请查看扩展宿主日志）'
+        : ('没有匹配「' + term + '」的命令（共 ' + DATA.items.length + ' 条，可点 × 清空搜索）');
       list.appendChild(d);
     }
     select(0);
@@ -982,11 +1010,19 @@ function buildHtml(
   }
 
   function redraw() {
+    updateClearBtn();
     render(currentList(), mode === 'source' && !q.value.trim());
   }
 
   q.addEventListener('input', redraw);
   sortSel.addEventListener('change', function () { setMode(sortSel.value); });
+
+  // 清空搜索：解决"上次输入的搜索词被 webview 保留，重载后列表看着是空的"
+  clearBtn.addEventListener('click', function () {
+    q.value = '';
+    redraw();
+    q.focus();
+  });
 
   q.addEventListener('keydown', function (e) {
     if (e.key === 'ArrowDown') { e.preventDefault(); select(sel + 1); }
