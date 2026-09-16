@@ -99,6 +99,25 @@ function prettyKey(key: string): string {
     .join(' ');
 }
 
+/** 命令 ID 形如 xxx.key.ctrl+right 的，是扩展用来转发按键的内部辅助命令 */
+const KEY_PROXY_ID = /\.key\.(ctrl|shift|alt|cmd|meta|escape|enter|tab|space|left|right|up|down|home|end|pageup|pagedown|backspace|delete|f\d{1,2})([+.]|$)/i;
+
+/** 把没有标题的命令 ID 变得可读一点。
+ *  取最后两节（扩展名 + 命令名）以便辨认来源：
+ *    gitlens.copyRemoteFileUrl → Gitlens Copy Remote File Url
+ *    claude-vscode.terminal.open.keyboard → Open Keyboard
+ */
+function humanizeCommandId(id: string): string {
+  const parts = String(id).split('.').filter(Boolean);
+  const tail = parts.slice(-2).join(' ') || String(id);
+  return tail
+    .replace(/[-_]+/g, ' ')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, (ch) => ch.toUpperCase());
+}
+
 /** 收集已安装扩展贡献的命令标题与键位（走公开的 packageJSON） */
 function collectExtensionContributions(): { titles: Map<string, string>; keys: Map<string, string> } {
   const titles = new Map<string, string>();
@@ -126,7 +145,14 @@ function collectExtensionContributions(): { titles: Map<string, string>; keys: M
     }
 
     for (const kb of contributes.keybindings ?? []) {
-      if (typeof kb?.command === 'string' && typeof kb?.key === 'string' && !keys.has(kb.command)) {
+      if (typeof kb?.command !== 'string' || typeof kb?.key !== 'string') {
+        continue;
+      }
+      // 跳过内部按键代理命令：它们没有标题，列出来只是一串 "gitlens.key.ctrl+right" 噪音
+      if (KEY_PROXY_ID.test(kb.command) && !titles.has(kb.command)) {
+        continue;
+      }
+      if (!keys.has(kb.command)) {
         keys.set(kb.command, prettyKey(kb.key));
       }
     }
@@ -244,7 +270,8 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
           continue;
         }
         extras.push({
-          label: String(titles.get(command) ?? command),
+          // 有正式标题就用标题；没有则把命令 ID 尾部转成可读文本
+          label: titles.get(command) ?? humanizeCommandId(command),
           command: String(command),
           keys: key ? String(key) : undefined,
           available: true,
