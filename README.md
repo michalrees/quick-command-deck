@@ -90,7 +90,7 @@ npm run package      # 生成 .vsix
 本地联调（不用反复打包）也可以直接把工程目录做成扩展目录的 junction：
 
 ```powershell
-cmd /c mklink /J "%USERPROFILE%\.vscode\extensions\<publisher>.quick-command-deck-0.1.0" "E:\Michal\Repos\VSCode\quick-command-deck"
+cmd /c mklink /J "%USERPROFILE%\.vscode\extensions\<publisher>.quick-command-deck" "<你的工程目录>"
 ```
 
 ## 许可
