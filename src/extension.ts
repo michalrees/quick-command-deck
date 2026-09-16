@@ -1,3 +1,5 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { DEFAULT_COMMANDS, CommandItem } from './commands';
 
@@ -8,7 +10,7 @@ const VIEW_ID = 'quickCommandDeck.view';
 const STATE_USAGE = 'quickCommandDeck.usage';
 const STATE_SORT = 'quickCommandDeck.sortMode';
 
-type SortMode = 'default' | 'usage' | 'alpha';
+type SortMode = 'default' | 'usage' | 'alpha' | 'source';
 
 export function activate(context: vscode.ExtensionContext): void {
   const provider = new CommandDeckViewProvider(context);
@@ -46,8 +48,10 @@ export function deactivate(): void {
 
 interface DeckItem extends CommandItem {
   available: boolean;
-  /** true = 来自已安装扩展声明的键位（不是内置清单里的条目） */
-  fromExtension?: boolean;
+  /** 来源：undefined/'' = 内置清单；否则为扩展显示名 */
+  source?: string;
+  /** 组内排序用：命令标题（不含前缀） */
+  bare?: string;
   /** 累计点击执行次数（本扩展自己统计） */
   usage?: number;
 }
@@ -77,6 +81,10 @@ interface ExtensionContribution {
   command?: string;
 }
 
+/** 命令 ID 形如 xxx.key.ctrl+right 的，是扩展用来转发按键的内部辅助命令 */
+const KEY_PROXY_ID =
+  /\.key\.(ctrl|shift|alt|cmd|meta|escape|enter|tab|space|left|right|up|down|home|end|pageup|pagedown|backspace|delete|f\d{1,2})([+.]|$)/i;
+
 /** ctrl+shift+p → Ctrl+Shift+P */
 function prettyKey(key: string): string {
   return key
@@ -99,70 +107,185 @@ function prettyKey(key: string): string {
     .join(' ');
 }
 
-/** 命令 ID 形如 xxx.key.ctrl+right 的，是扩展用来转发按键的内部辅助命令 */
-const KEY_PROXY_ID = /\.key\.(ctrl|shift|alt|cmd|meta|escape|enter|tab|space|left|right|up|down|home|end|pageup|pagedown|backspace|delete|f\d{1,2})([+.]|$)/i;
-
-/** 把没有标题的命令 ID 变得可读一点。
- *  取最后两节（扩展名 + 命令名）以便辨认来源：
- *    gitlens.copyRemoteFileUrl → Gitlens Copy Remote File Url
- *    claude-vscode.terminal.open.keyboard → Open Keyboard
- */
-function humanizeCommandId(id: string): string {
-  const parts = String(id).split('.').filter(Boolean);
-  const tail = parts.slice(-2).join(' ') || String(id);
-  return tail
-    .replace(/[-_]+/g, ' ')
-    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/\b\w/g, (ch) => ch.toUpperCase());
+/** 把没有标题的命令 ID 变得可读：去掉该扩展的命名空间，剩下的按驼峰/连字符拆词 */
+function humanizeCommandId(id: string, strip?: string): string {
+  let s = String(id);
+  if (strip) {
+    const ns = strip.endsWith('.') ? strip : strip + '.';
+    if (s.toLowerCase().startsWith(ns.toLowerCase())) {
+      s = s.slice(ns.length);
+    }
+  }
+  return (
+    s
+      .split('.')
+      .filter(Boolean)
+      .join(' ')
+      .replace(/[-_]+/g, ' ')
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/\b\w/g, (ch) => ch.toUpperCase()) || String(id)
+  );
 }
 
-/** 收集已安装扩展贡献的命令标题与键位（走公开的 packageJSON） */
-function collectExtensionContributions(): { titles: Map<string, string>; keys: Map<string, string> } {
-  const titles = new Map<string, string>();
+/** 粗略判断某命令是否属于该扩展的命名空间（用于给内置命令标来源） */
+function belongsToNamespace(command: string, extId: string): boolean {
+  const ns = extId.toLowerCase();
+  const cmd = command.toLowerCase();
+  return cmd === ns || cmd.startsWith(ns + '.') || cmd.startsWith(ns + '-');
+}
+
+interface Contributions {
+  /** 命令 ID → 扩展显示名 */
+  owners: Map<string, string>;
+  /** 命令 ID → 该扩展命名空间（用于生成裸标题） */
+  namespaces: Map<string, string>;
+  /** 命令 ID → 标题（去掉"扩展名: "前缀后的裸标题） */
+  bareTitles: Map<string, string>;
+  /** 命令 ID → 键位 */
+  keys: Map<string, string>;
+  /** 扩展 ID（小写）→ 显示名，用于按命名空间反查来源 */
+  extNames: Map<string, string>;
+}
+
+/**
+ * 汇总已安装扩展贡献的命令/键位/显示名。
+ * 全部走公开的 packageJSON，不依赖任何私有实现。
+ */
+function collectContributions(): Contributions {
+  const owners = new Map<string, string>();
+  const namespaces = new Map<string, string>();
+  const bareTitles = new Map<string, string>();
   const keys = new Map<string, string>();
+  const extNames = new Map<string, string>();
 
   for (const ext of vscode.extensions.all) {
     const pkg = ext.packageJSON as
       | {
+          displayName?: string;
+          name?: string;
           contributes?: {
             commands?: Array<{ command?: string; title?: string }>;
             keybindings?: ExtensionContribution[];
           };
         }
       | undefined;
-    const contributes = pkg?.contributes;
-    if (!contributes) {
+    if (!pkg) {
       continue;
     }
+    const rawDisplay = String(pkg.displayName || pkg.name || ext.id);
+    // displayName 里可能出现未解析的本地化占位符（如 %ext.displayName%），退回包名
+    const displayName = /%[a-zA-Z][a-zA-Z0-9_.]*%/.test(rawDisplay)
+      ? String(pkg.name || ext.id)
+      : rawDisplay;
+    const ns = String(pkg.name || ext.id.split('.').pop() || '');
+    extNames.set(ext.id.toLowerCase(), displayName);
+    extNames.set(ns.toLowerCase(), displayName);
 
-    // 只接受字符串：packageJSON 是任意 JSON，title/command 可能是数字或对象
-    for (const c of contributes.commands ?? []) {
-      if (typeof c?.command === 'string' && typeof c?.title === 'string' && !titles.has(c.command)) {
-        titles.set(c.command, c.title);
+    // 语言包：把标题里的 %key% 解析成真实文案（中文优先，英文兜底）
+    const nls = readNlsBundles(ext.extensionPath);
+
+    for (const c of pkg.contributes?.commands ?? []) {
+      if (typeof c?.command !== 'string') {
+        continue;
+      }
+      if (!owners.has(c.command)) {
+        owners.set(c.command, displayName);
+        namespaces.set(c.command, ns);
+      }
+      if (typeof c.title === 'string' && !bareTitles.has(c.command)) {
+        // 先解析语言包，再去掉 "扩展名: " 这种前缀，避免列表里重复
+        const resolved = resolveNlsTitle(c.title, nls);
+        if (resolved) {
+          const stripped = resolved.replace(/^[^:：]{1,40}[:：]\s*/, '');
+          const clean = stripped || resolved;
+          if (clean.trim()) {
+            bareTitles.set(c.command, clean);
+          }
+        }
       }
     }
 
-    for (const kb of contributes.keybindings ?? []) {
+    for (const kb of pkg.contributes?.keybindings ?? []) {
       if (typeof kb?.command !== 'string' || typeof kb?.key !== 'string') {
         continue;
       }
-      // 跳过内部按键代理命令：它们没有标题，列出来只是一串 "gitlens.key.ctrl+right" 噪音
-      if (KEY_PROXY_ID.test(kb.command) && !titles.has(kb.command)) {
+      // 跳过内部按键代理命令：没有标题，列出来只是一串 "gitlens.key.ctrl+right" 噪音
+      if (KEY_PROXY_ID.test(kb.command) && !owners.has(kb.command)) {
         continue;
       }
+      // ★ 只收键位，不改归属：很多扩展会给"别人的/内置的"命令声明键位
+      //   （如 GitLens 给 workbench.view.scm 声明键位），据此认领来源会误判
       if (!keys.has(kb.command)) {
         keys.set(kb.command, prettyKey(kb.key));
       }
     }
   }
 
-  return { titles, keys };
+  return { owners, namespaces, bareTitles, keys, extNames };
 }
 
-function escapeHtml(s: string): string {
-  return String(s)
+/** 标题里形如 %some.key% 的是扩展的本地化 key（未解析） */
+const NLS_KEY = /%([a-zA-Z][a-zA-Z0-9_.]*)%/g;
+
+/**
+ * 读取扩展自带的语言包，用于把标题里的 %key% 解析成真实文字。
+ * 很多扩展（LaTeX Workshop / Project Manager / Python …）把标题写成 %command.xxx%，
+ * 由 package.nls.json 提供文案；不解析的话列表里只能显示这串 key。
+ *
+ * 返回候选包列表：中文包优先，英文包兜底（有的 key 只在其中一边存在）。
+ */
+function readNlsBundles(extRoot: string): Array<Record<string, string>> {
+  const out: Array<Record<string, string>> = [];
+  for (const file of ['package.nls.zh-cn.json', 'package.nls.json']) {
+    try {
+      const p = path.join(extRoot, file);
+      if (!fs.existsSync(p)) {
+        continue;
+      }
+      const parsed = JSON.parse(fs.readFileSync(p, 'utf8')) as Record<string, string>;
+      if (parsed && typeof parsed === 'object') {
+        out.push(parsed);
+      }
+    } catch {
+      /* 语言包损坏就跳过，退回可读化处理 */
+    }
+  }
+  return out;
+}
+
+/** 用单个语言包解析 %key%；有任何 key 缺失就返回 null */
+function resolveWithBundle(title: string, bundle: Record<string, string>): string | null {
+  NLS_KEY.lastIndex = 0;
+  let allFound = true;
+  const out = title.replace(NLS_KEY, (m, key: string) => {
+    const v = bundle[key];
+    if (typeof v === 'string') {
+      return v;
+    }
+    allFound = false;
+    return m;
+  });
+  return allFound ? out : null;
+}
+
+/** 把标题里的 %key% 尽量解析成真实文案；所有语言包都解析不出来则返回 null */
+function resolveNlsTitle(title: string, bundles: Array<Record<string, string>>): string | null {
+  NLS_KEY.lastIndex = 0;
+  if (!NLS_KEY.test(title)) {
+    return title; // 没有占位符，原样使用
+  }
+  for (const b of bundles) {
+    const r = resolveWithBundle(title, b);
+    if (r) {
+      return r;
+    }
+  }
+  return null;
+}
+
+function escapeHtml(s: string): string {  return String(s)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -220,7 +343,7 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
 
   private sortMode(): SortMode {
     const m = this.context.globalState.get<string>(STATE_SORT, 'default');
-    return m === 'usage' || m === 'alpha' ? (m as SortMode) : 'default';
+    return m === 'usage' || m === 'alpha' || m === 'source' ? (m as SortMode) : 'default';
   }
 
   private async setSortMode(mode: SortMode): Promise<void> {
@@ -248,7 +371,7 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
       available = new Set<string>();
     }
 
-    const { titles, keys } = collectExtensionContributions();
+    const con = collectContributions();
     const usage = this.usageMap();
 
     // 设置里的 commands 是任意 JSON，label/command 可能是 undefined 或非字符串，
@@ -259,31 +382,36 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
       .map((it) => ({
         label: String(it.label ?? it.command),
         command: String(it.command),
-        keys: it.keys ? String(it.keys) : keys.get(String(it.command)),
+        keys: it.keys ? String(it.keys) : con.keys.get(String(it.command)),
         available: available.has(String(it.command))
       }));
 
+    // ── 扩展命令：名字带"扩展显示名:"前缀（用户选定），无正式标题则按 ID 可读化 ──
     const extras: DeckItem[] = [];
     if (includeExtensions) {
-      for (const [command, key] of keys) {
-        if (!available.has(command)) {
+      for (const [command, key] of con.keys) {
+        // 只列"由某个扩展真正声明"的命令；只声明键位的不算，
+        // 否则会把内置命令（如 workbench.view.scm）也当成扩展命令收进来
+        if (!available.has(command) || !con.owners.has(command)) {
           continue;
         }
+        const source = con.owners.get(command) ?? '';
+        const bare = con.bareTitles.get(command) ?? humanizeCommandId(command, con.namespaces.get(command));
         extras.push({
-          // 有正式标题就用标题；没有则把命令 ID 尾部转成可读文本
-          label: titles.get(command) ?? humanizeCommandId(command),
+          label: source ? `${source}: ${bare}` : bare,
+          bare,
+          source,
           command: String(command),
           keys: key ? String(key) : undefined,
-          available: true,
-          fromExtension: true
+          available: true
         });
       }
       extras.sort((a, b) => String(a.label).localeCompare(String(b.label), 'zh-Hans-CN'));
     }
 
-    // ── 双向去重 ────────────────────────────────────────────────────────
-    // ① 命令 ID 相同：内置清单与扩展声明常指向同一命令 → 保留先出现的（内置优先）
-    // ② 键位相同：不同扩展声明同一键位 → 只保留第一个
+    // ── 双向去重（内置清单优先）────────────────────────────────────────
+    // ① 命令 ID 相同 → 保留内置那条
+    // ② 键位相同 → 只保留第一个
     const seenCommands = new Set<string>();
     const seenKeys = new Set<string>();
     const merged: DeckItem[] = [];
@@ -304,17 +432,46 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
       merged.push(it);
     }
 
-    // 附上使用次数
+    // 给没有来源的条目补来源：按命名空间反查（VS Code 内置命令有 vscode.xxx 形式的归属）
+    for (const it of merged) {
+      if (it.source) {
+        continue;
+      }
+      const cmd = String(it.command).toLowerCase();
+      const head = cmd.split('.')[0];
+      if (head.length >= 3) {
+        const owner = con.extNames.get(head);
+        if (owner) {
+          it.source = owner;
+        }
+      }
+    }
+
     for (const it of merged) {
       it.usage = usage[it.command] ?? 0;
     }
 
     const mode = this.sortMode();
     if (mode === 'usage') {
-      // 用过的排前面（次数多的在前）；没用过的是 0，保持原顺序垫后
       merged.sort((a, b) => (b.usage ?? 0) - (a.usage ?? 0));
     } else if (mode === 'alpha') {
       merged.sort((a, b) => String(a.label).localeCompare(String(b.label), 'zh-Hans-CN'));
+    } else if (mode === 'source') {
+      // 内置在最前，然后各扩展按显示名排序；组内按名称
+      merged.sort((a, b) => {
+        const sa = a.source ?? '';
+        const sb = b.source ?? '';
+        if (sa !== sb) {
+          if (!sa) {
+            return -1;
+          }
+          if (!sb) {
+            return 1;
+          }
+          return sa.localeCompare(sb, 'zh-Hans-CN');
+        }
+        return String(a.bare ?? a.label).localeCompare(String(b.bare ?? b.label), 'zh-Hans-CN');
+      });
     }
 
     try {
@@ -345,7 +502,7 @@ function buildHtml(
       c: String(i.command ?? ''),
       k: i.keys === undefined || i.keys === null ? '' : String(i.keys),
       a: !!i.available,
-      e: i.fromExtension ? 1 : 0,
+      s: i.source ? String(i.source) : '',
       u: i.usage ?? 0
     })),
     showKeys: !!opts.showKeys,
@@ -403,20 +560,42 @@ function buildHtml(
   #q:focus { border-color: var(--vscode-focusBorder); }
   #q::placeholder { color: var(--vscode-input-placeholderForeground); }
 
-  .sortrow { display: flex; align-items: center; gap: 6px; }
-  .sortbtn {
-    font: inherit;
-    font-size: .85em;
-    padding: 2px 7px;
-    color: var(--vscode-foreground);
-    background: transparent;
+  .sortrow { display: flex; align-items: center; gap: 5px; }
+  .seg {
+    display: flex;
     border: 1px solid var(--vscode-panel-border, rgba(128,128,128,.4));
     border-radius: 4px;
-    cursor: pointer;
-    opacity: .85;
+    overflow: hidden;
   }
-  .sortbtn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.18)); opacity: 1; }
-  .sorthint { font-size: .8em; opacity: .55; }
+  .seg button {
+    font: inherit;
+    font-size: .82em;
+    padding: 2px 8px;
+    border: 0;
+    border-right: 1px solid var(--vscode-panel-border, rgba(128,128,128,.4));
+    background: transparent;
+    color: var(--vscode-foreground);
+    cursor: pointer;
+    opacity: .8;
+  }
+  .seg button:last-child { border-right: 0; }
+  .seg button:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.18)); opacity: 1; }
+  .seg button.on {
+    background: var(--vscode-list-activeSelectionBackground, rgba(128,128,128,.3));
+    color: var(--vscode-list-activeSelectionForeground, inherit);
+    opacity: 1;
+  }
+  #sortsel {
+    font: inherit;
+    font-size: .82em;
+    padding: 2px 4px;
+    color: var(--vscode-dropdown-foreground, var(--vscode-foreground));
+    background: var(--vscode-dropdown-background, transparent);
+    border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border, rgba(128,128,128,.4)));
+    border-radius: 4px;
+    outline: none;
+  }
+  .hint { font-size: .78em; opacity: .55; margin-left: auto; }
 
   .list {
     flex: 1 1 auto;
@@ -467,13 +646,17 @@ function buildHtml(
     border-radius: 4px;
   }
   .plus { font-size: .8em; opacity: .55; }
-  .sep {
-    margin: 9px 4px 1px 4px;
-    padding-top: 6px;
+
+  /* 分组标题（按来源分组，或在扩展段开始处） */
+  .grouphead {
+    margin: 8px 4px 1px 4px;
+    padding-top: 5px;
     border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,.35));
-    font-size: .82em;
-    opacity: .6;
+    font-size: .8em;
+    opacity: .62;
+    text-transform: none;
   }
+  .grouphead:first-child { border-top: 0; padding-top: 0; margin-top: 2px; }
   .empty { padding: 10px; opacity: .6; font-size: .9em; }
 </style>
 </head>
@@ -481,8 +664,9 @@ function buildHtml(
   <div class="toolbar">
     <input id="q" type="text" placeholder="搜索命令或键位…" autocomplete="off" spellcheck="false" />
     <div class="sortrow">
-      <button class="sortbtn" id="sortbtn" type="button"></button>
-      <span class="sorthint" id="sorthint"></span>
+      <select id="sortsel" title="排序方式"></select>
+      <div class="seg" id="seg"></div>
+      <span class="hint" id="hint"></span>
     </div>
   </div>
   <div class="list" id="list"></div>
@@ -492,22 +676,53 @@ function buildHtml(
   const DATA = ${payload};
   const SHOW_KEYS = ${opts.showKeys ? 'true' : 'false'};
 
-  const MODES = ['default', 'usage', 'alpha'];
-  const MODE_LABEL = { default: '默认顺序', usage: '按使用次数', alpha: '按名称' };
+  const MODES = ['default', 'usage', 'alpha', 'source'];
+  const MODE_LABEL = {
+    default: '默认顺序',
+    usage: '按使用次数',
+    alpha: '按名称',
+    source: '按来源分组'
+  };
+  const SHORT = { default: '默认', usage: '常用', alpha: '名称', source: '来源' };
   let mode = DATA.sortMode || 'default';
 
   const q = document.getElementById('q');
   const list = document.getElementById('list');
-  const sortBtn = document.getElementById('sortbtn');
-  const sortHint = document.getElementById('sorthint');
+  const sortSel = document.getElementById('sortsel');
+  const seg = document.getElementById('seg');
+  const hint = document.getElementById('hint');
   let rows = [];
   let sel = 0;
+  let showGroups = false;
 
-  function updateSortUi() {
-    sortBtn.textContent = '排序：' + MODE_LABEL[mode];
-    sortBtn.title = '点击切换排序方式：默认顺序 → 按使用次数 → 按名称';
+  function buildSortUi() {
+    sortSel.textContent = '';
+    MODES.forEach(function (m) {
+      const o = document.createElement('option');
+      o.value = m;
+      o.textContent = MODE_LABEL[m];
+      if (m === mode) o.selected = true;
+      sortSel.appendChild(o);
+    });
+    seg.textContent = '';
+    MODES.forEach(function (m) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = SHORT[m];
+      b.title = MODE_LABEL[m];
+      if (m === mode) b.className = 'on';
+      b.addEventListener('click', function () { setMode(m); });
+      seg.appendChild(b);
+    });
     const used = DATA.items.filter(function (i) { return (i.u || 0) > 0; }).length;
-    sortHint.textContent = mode === 'usage' ? ('已记录 ' + used + ' 条') : '';
+    hint.textContent = mode === 'usage' ? ('已记录 ' + used + ' 条') : '';
+  }
+
+  function setMode(m) {
+    if (m === mode) return;
+    mode = m;
+    buildSortUi();
+    vscode.postMessage({ type: 'sort', mode: m });
   }
 
   function buildKeys(text) {
@@ -557,17 +772,18 @@ function buildHtml(
     return btn;
   }
 
-  function render(items) {
+  function render(items, grouped) {
     list.textContent = '';
     rows = [];
-    let sepShown = false;
+    let lastGroup = null;
     items.forEach(function (it) {
-      if (it.e && !sepShown) {
-        const sep = document.createElement('div');
-        sep.className = 'sep';
-        sep.textContent = '来自已安装扩展';
-        list.appendChild(sep);
-        sepShown = true;
+      const g = grouped ? (it.s || '内置命令') : (it.s ? '__ext__' : null);
+      if (g && g !== lastGroup) {
+        const head = document.createElement('div');
+        head.className = 'grouphead';
+        head.textContent = grouped ? g : '来自已安装扩展';
+        list.appendChild(head);
+        lastGroup = g;
       }
       const btn = makeRow(it);
       list.appendChild(btn);
@@ -595,18 +811,20 @@ function buildHtml(
     if (cur) cur.el.scrollIntoView({ block: 'nearest' });
   }
 
-  function filter() {
+  function currentList() {
     const term = q.value.trim().toLowerCase();
-    if (!term) {
-      render(DATA.items);
-      return;
-    }
-    render(DATA.items.filter(function (it) {
+    if (!term) return DATA.items;
+    return DATA.items.filter(function (it) {
       return (it.n + ' ' + it.c + ' ' + (it.k || '')).toLowerCase().indexOf(term) >= 0;
-    }));
+    });
   }
 
-  q.addEventListener('input', filter);
+  function redraw() {
+    render(currentList(), mode === 'source' && !q.value.trim());
+  }
+
+  q.addEventListener('input', redraw);
+  sortSel.addEventListener('change', function () { setMode(sortSel.value); });
 
   q.addEventListener('keydown', function (e) {
     if (e.key === 'ArrowDown') { e.preventDefault(); select(sel + 1); }
@@ -617,19 +835,12 @@ function buildHtml(
       if (cur) fire(cur.item);
     } else if (e.key === 'Escape') {
       e.preventDefault();
-      if (q.value) { q.value = ''; filter(); }
+      if (q.value) { q.value = ''; redraw(); }
     }
   });
 
-  // 点一下在三种排序间循环；真正生效要扩展侧重新排序并重绘
-  sortBtn.addEventListener('click', function () {
-    mode = MODES[(MODES.indexOf(mode) + 1) % MODES.length];
-    updateSortUi();
-    vscode.postMessage({ type: 'sort', mode: mode });
-  });
-
-  updateSortUi();
-  render(DATA.items);
+  buildSortUi();
+  redraw();
   q.focus();
 </script>
 </body>
