@@ -1,0 +1,136 @@
+{
+  "name": "quick-command-deck",
+  "displayName": "Quick Command Deck",
+  "description": "把常用命令做成按钮，放在右侧辅助侧边栏（或左侧栏）；点击即直接执行真实命令，不依赖模拟按键。",
+  "version": "0.1.0",
+  "publisher": "YuHaoranOwner",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "commands",
+    "sidebar",
+    "auxiliary bar",
+    "shortcuts",
+    "productivity"
+  ],
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/michalrees/quick-command-deck"
+  },
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onView:quickCommandDeck.view",
+    "onCommand:quickCommandDeck.open"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "quickCommandDeck.open",
+        "title": "打开命令面板（侧边栏）",
+        "category": "Quick Command Deck"
+      },
+      {
+        "command": "quickCommandDeck.refresh",
+        "title": "刷新命令可用性",
+        "category": "Quick Command Deck",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "quickCommandDeck.refresh",
+          "when": "view == quickCommandDeck.view",
+          "group": "navigation"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "auxiliarybar": [
+        {
+          "id": "quickCommandDeck",
+          "title": "Command Deck",
+          "icon": "media/view-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "quickCommandDeck": [
+        {
+          "id": "quickCommandDeck.view",
+          "name": "快捷命令",
+          "type": "webview"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Quick Command Deck",
+      "properties": {
+        "quickCommandDeck.fontSize": {
+          "type": "number",
+          "default": 16,
+          "minimum": 9,
+          "maximum": 32,
+          "description": "面板内文字字号（px）。"
+        },
+        "quickCommandDeck.showKeys": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否显示每条命令的默认键位。"
+        },
+        "quickCommandDeck.dense": {
+          "type": "boolean",
+          "default": false,
+          "description": "紧凑模式：减小行距与内边距。"
+        },
+        "quickCommandDeck.includeExtensionCommands": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否把已安装扩展声明的键位也一起列进主列表（与内置清单自动去重）。关闭后只显示内置/自定义清单。"
+        },
+        "quickCommandDeck.commands": {
+          "type": "array",
+          "description": "要显示的命令列表。留空则使用内置的常用命令；数组顺序即显示顺序。",
+          "default": [],
+          "items": {
+            "type": "object",
+            "required": [
+              "label",
+              "command"
+            ],
+            "properties": {
+              "label": {
+                "type": "string",
+                "description": "按钮上显示的名称。"
+              },
+              "command": {
+                "type": "string",
+                "description": "要执行的 VS Code 命令 ID，例如 workbench.action.quickOpen。"
+              },
+              "keys": {
+                "type": "string",
+                "description": "默认键位，仅用于显示提示（例如 Ctrl+Shift+P）。"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.4.0"
+  }
+}
