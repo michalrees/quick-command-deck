@@ -540,7 +540,7 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
       for (const command of candidates) {
         // 只列"由某个扩展真正声明"的命令；只声明键位的不算，
         // 否则会把内置命令（如 workbench.view.scm）也当成扩展命令收进来
-        if (!available.has(command) || !con.owners.has(command)) {
+        if (!con.owners.has(command)) {
           continue;
         }
         const source = con.owners.get(command) ?? '';
@@ -552,7 +552,13 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
           source,
           command: String(command),
           keys: keyOf(command),
-          available: true
+          // ★ 关键：不再要求"当前已注册"。
+          //   很多扩展是懒激活的（如 LaTeX Workshop 只在 onCommand/onWebviewPanel 时激活），
+          //   未激活时它的命令不在 getCommands() 里，但用户明明在 keybindings.json 里绑了它。
+          //   以前这里用 available.has() 过滤，导致这类命令永远不显示、也搜不到。
+          //   现在：有自定义绑定的一律可用；扩展声明的若尚未注册则标为"未激活"但仍列出，
+          //   点击时若确实执行不了会弹提示。
+          available: available.has(command) || con.userKeys.has(command)
         });
       }
       extras.sort((a, b) => String(a.label).localeCompare(String(b.label), 'zh-Hans-CN'));
