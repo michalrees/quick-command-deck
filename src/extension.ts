@@ -1001,9 +1001,28 @@ function buildHtml(
     }
   });
 
-  buildSortUi();
-  redraw();
-  q.focus();
+  // 前端初始化兜底：任何异常都画在页面上，而不是留一片空白让人猜
+  function showFatal(msg) {
+    try {
+      const d = document.createElement('div');
+      d.style.cssText = 'padding:10px;white-space:pre-wrap;font-family:monospace;font-size:12px;color:var(--vscode-foreground)';
+      d.textContent = 'Command Deck 前端初始化失败：\n' + msg;
+      document.body.appendChild(d);
+    } catch (e) {
+      document.body.textContent = 'Command Deck 初始化失败: ' + msg;
+    }
+  }
+
+  try {
+    if (!DATA || !Array.isArray(DATA.items)) {
+      throw new Error('payload 异常：items 不是数组（' + JSON.stringify(DATA).slice(0, 120) + '）');
+    }
+    buildSortUi();
+    redraw();
+    q.focus();
+  } catch (err) {
+    showFatal(String((err && err.stack) || err));
+  }
 </script>
 </body>
 </html>`;
