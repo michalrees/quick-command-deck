@@ -16,7 +16,7 @@
 ### 从 VSIX 安装
 
 ```bash
-code --install-extension quick-command-deck-0.1.0.vsix
+code --install-extension quick-command-deck-<version>.vsix
 ```
 
 或在 VS Code 里：`扩展` 视图 → 右上角 `...` → **Install from VSIX...** → 选中 `.vsix`
