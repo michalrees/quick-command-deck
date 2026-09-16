@@ -4,8 +4,14 @@ import { DEFAULT_COMMANDS, CommandItem } from './commands';
 /** 面板视图 ID（与 package.json 里的 views 贡献保持一致） */
 const VIEW_ID = 'quickCommandDeck.view';
 
+/** 使用次数 / 排序偏好的存储键（存在 globalState，跨工作区保留） */
+const STATE_USAGE = 'quickCommandDeck.usage';
+const STATE_SORT = 'quickCommandDeck.sortMode';
+
+type SortMode = 'default' | 'usage' | 'alpha';
+
 export function activate(context: vscode.ExtensionContext): void {
-  const provider = new CommandDeckViewProvider();
+  const provider = new CommandDeckViewProvider(context);
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(VIEW_ID, provider, {
@@ -42,6 +48,8 @@ interface DeckItem extends CommandItem {
   available: boolean;
   /** true = 来自已安装扩展声明的键位（不是内置清单里的条目） */
   fromExtension?: boolean;
+  /** 累计点击执行次数（本扩展自己统计） */
+  usage?: number;
 }
 
 interface DeckSettings {
@@ -56,7 +64,7 @@ function readSettings(): DeckSettings {
   const cfg = vscode.workspace.getConfiguration('quickCommandDeck');
   const raw = cfg.get<CommandItem[]>('commands', []);
   return {
-    fontSize: cfg.get<number>('fontSize', 15),
+    fontSize: cfg.get<number>('fontSize', 14),
     showKeys: cfg.get<boolean>('showKeys', true),
     dense: cfg.get<boolean>('dense', false),
     includeExtensions: cfg.get<boolean>('includeExtensionCommands', true),
@@ -69,7 +77,7 @@ interface ExtensionContribution {
   command?: string;
 }
 
-/** 把 ctrl+shift+p 这类键位字符串变得好读：Ctrl+Shift+P */
+/** ctrl+shift+p → Ctrl+Shift+P */
 function prettyKey(key: string): string {
   return key
     .split(' ')
@@ -91,10 +99,7 @@ function prettyKey(key: string): string {
     .join(' ');
 }
 
-/**
- * 收集已安装扩展贡献的：命令标题 + 键位。
- * 走扩展公开的 packageJSON，不依赖任何私有实现。
- */
+/** 收集已安装扩展贡献的命令标题与键位（走公开的 packageJSON） */
 function collectExtensionContributions(): { titles: Map<string, string>; keys: Map<string, string> } {
   const titles = new Map<string, string>();
   const keys = new Map<string, string>();
@@ -150,22 +155,31 @@ function nonce(): string {
 class CommandDeckViewProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | undefined;
 
+  constructor(private readonly context: vscode.ExtensionContext) {}
+
   public resolveWebviewView(webviewView: vscode.WebviewView): void {
     this.view = webviewView;
     webviewView.webview.options = { enableScripts: true };
 
-    webviewView.webview.onDidReceiveMessage(async (msg: { type?: string; command?: string }) => {
-      const cmd = msg?.command;
-      if ((msg?.type === 'execute' || msg?.type === 'run') && cmd) {
-        try {
-          await vscode.commands.executeCommand(cmd);
-        } catch (err) {
-          vscode.window.showWarningMessage(
-            `命令执行失败：${cmd} —— ${err instanceof Error ? err.message : String(err)}`
-          );
+    webviewView.webview.onDidReceiveMessage(
+      async (msg: { type?: string; command?: string; mode?: string }) => {
+        if (msg?.type === 'sort' && msg.mode) {
+          await this.setSortMode(msg.mode as SortMode);
+          return;
+        }
+        const cmd = msg?.command;
+        if ((msg?.type === 'execute' || msg?.type === 'run') && cmd) {
+          await this.bumpUsage(cmd);
+          try {
+            await vscode.commands.executeCommand(cmd);
+          } catch (err) {
+            vscode.window.showWarningMessage(
+              `命令执行失败：${cmd} —— ${err instanceof Error ? err.message : String(err)}`
+            );
+          }
         }
       }
-    });
+    );
 
     void this.render();
   }
@@ -174,13 +188,33 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
     void this.render();
   }
 
+  private usageMap(): Record<string, number> {
+    return this.context.globalState.get<Record<string, number>>(STATE_USAGE, {});
+  }
+
+  private sortMode(): SortMode {
+    const m = this.context.globalState.get<string>(STATE_SORT, 'default');
+    return m === 'usage' || m === 'alpha' ? (m as SortMode) : 'default';
+  }
+
+  private async setSortMode(mode: SortMode): Promise<void> {
+    await this.context.globalState.update(STATE_SORT, mode);
+    await this.render();
+  }
+
+  /** 记一次点击；存 globalState，跨工作区累计 */
+  private async bumpUsage(command: string): Promise<void> {
+    const map = { ...this.usageMap() };
+    map[command] = (map[command] ?? 0) + 1;
+    await this.context.globalState.update(STATE_USAGE, map);
+  }
+
   private async render(): Promise<void> {
     if (!this.view) {
       return;
     }
     const { fontSize, showKeys, dense, includeExtensions, userCommands } = readSettings();
 
-    // 可用命令：不存在的置灰，避免"点了没反应"
     let available: Set<string>;
     try {
       available = new Set(await vscode.commands.getCommands(true));
@@ -189,6 +223,7 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
     }
 
     const { titles, keys } = collectExtensionContributions();
+    const usage = this.usageMap();
 
     // 设置里的 commands 是任意 JSON，label/command 可能是 undefined 或非字符串，
     // 一律 String() 兜住，避免后续比较/排序抛异常
@@ -202,7 +237,6 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
         available: available.has(String(it.command))
       }));
 
-    // 扩展声明的键位
     const extras: DeckItem[] = [];
     if (includeExtensions) {
       for (const [command, key] of keys) {
@@ -220,10 +254,9 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
       extras.sort((a, b) => String(a.label).localeCompare(String(b.label), 'zh-Hans-CN'));
     }
 
-    // ── 双向去重，解决"重复键位" ─────────────────────────────────────────
-    // ① 命令 ID 重复：内置清单与扩展声明常指向同一命令 → 保留先出现的（内置优先）
-    // ② 键位重复：不同扩展声明同一键位 → 只保留第一个
-    //    （键位相同的命令按下去效果一样，列两遍纯干扰）
+    // ── 双向去重 ────────────────────────────────────────────────────────
+    // ① 命令 ID 相同：内置清单与扩展声明常指向同一命令 → 保留先出现的（内置优先）
+    // ② 键位相同：不同扩展声明同一键位 → 只保留第一个
     const seenCommands = new Set<string>();
     const seenKeys = new Set<string>();
     const merged: DeckItem[] = [];
@@ -244,12 +277,25 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
       merged.push(it);
     }
 
-    // 兜底：渲染异常直接显示在视图里，而不是留一片空白
+    // 附上使用次数
+    for (const it of merged) {
+      it.usage = usage[it.command] ?? 0;
+    }
+
+    const mode = this.sortMode();
+    if (mode === 'usage') {
+      // 用过的排前面（次数多的在前）；没用过的是 0，保持原顺序垫后
+      merged.sort((a, b) => (b.usage ?? 0) - (a.usage ?? 0));
+    } else if (mode === 'alpha') {
+      merged.sort((a, b) => String(a.label).localeCompare(String(b.label), 'zh-Hans-CN'));
+    }
+
     try {
       this.view.webview.html = buildHtml(merged, {
         fontSize,
         showKeys,
         dense,
+        mode,
         nonce: nonce()
       });
     } catch (err) {
@@ -264,7 +310,7 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
 
 function buildHtml(
   items: DeckItem[],
-  opts: { fontSize: number; showKeys: boolean; dense: boolean; nonce: string }
+  opts: { fontSize: number; showKeys: boolean; dense: boolean; mode: SortMode; nonce: string }
 ): string {
   const payload = JSON.stringify({
     items: items.map((i) => ({
@@ -272,9 +318,11 @@ function buildHtml(
       c: String(i.command ?? ''),
       k: i.keys === undefined || i.keys === null ? '' : String(i.keys),
       a: !!i.available,
-      e: i.fromExtension ? 1 : 0
+      e: i.fromExtension ? 1 : 0,
+      u: i.usage ?? 0
     })),
-    showKeys: !!opts.showKeys
+    showKeys: !!opts.showKeys,
+    sortMode: opts.mode
   });
 
   const csp = [
@@ -307,9 +355,12 @@ function buildHtml(
     color: var(--vscode-foreground);
     overflow: hidden;
   }
-  .searchwrap {
+  .toolbar {
     flex: 0 0 auto;
     padding: 6px 6px 4px 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
     background: var(--vscode-sideBar-background, transparent);
   }
   #q {
@@ -324,6 +375,21 @@ function buildHtml(
   }
   #q:focus { border-color: var(--vscode-focusBorder); }
   #q::placeholder { color: var(--vscode-input-placeholderForeground); }
+
+  .sortrow { display: flex; align-items: center; gap: 6px; }
+  .sortbtn {
+    font: inherit;
+    font-size: .85em;
+    padding: 2px 7px;
+    color: var(--vscode-foreground);
+    background: transparent;
+    border: 1px solid var(--vscode-panel-border, rgba(128,128,128,.4));
+    border-radius: 4px;
+    cursor: pointer;
+    opacity: .85;
+  }
+  .sortbtn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.18)); opacity: 1; }
+  .sorthint { font-size: .8em; opacity: .55; }
 
   .list {
     flex: 1 1 auto;
@@ -357,14 +423,7 @@ function buildHtml(
   .row .label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .row.missing { opacity: .45; cursor: not-allowed; }
 
-  /* ── 键位：每个键一个框（仿 VS Code 自身的按键提示样式）── */
-  .keys {
-    flex: 0 0 auto;
-    display: flex;
-    align-items: center;
-    gap: 3px;
-    white-space: nowrap;
-  }
+  .keys { flex: 0 0 auto; display: flex; align-items: center; gap: 3px; white-space: nowrap; }
   .key {
     display: inline-flex;
     align-items: center;
@@ -392,8 +451,12 @@ function buildHtml(
 </style>
 </head>
 <body>
-  <div class="searchwrap">
+  <div class="toolbar">
     <input id="q" type="text" placeholder="搜索命令或键位…" autocomplete="off" spellcheck="false" />
+    <div class="sortrow">
+      <button class="sortbtn" id="sortbtn" type="button"></button>
+      <span class="sorthint" id="sorthint"></span>
+    </div>
   </div>
   <div class="list" id="list"></div>
 
@@ -402,13 +465,24 @@ function buildHtml(
   const DATA = ${payload};
   const SHOW_KEYS = ${opts.showKeys ? 'true' : 'false'};
 
+  const MODES = ['default', 'usage', 'alpha'];
+  const MODE_LABEL = { default: '默认顺序', usage: '按使用次数', alpha: '按名称' };
+  let mode = DATA.sortMode || 'default';
+
   const q = document.getElementById('q');
   const list = document.getElementById('list');
+  const sortBtn = document.getElementById('sortbtn');
+  const sortHint = document.getElementById('sorthint');
   let rows = [];
   let sel = 0;
 
-  // 把 "Ctrl+Shift+P" 渲染成 [Ctrl][+][Shift][+][P]
-  // 和弦 "Ctrl+K Ctrl+S" 渲染成 [Ctrl][+][K] 空格 [Ctrl][+][S]
+  function updateSortUi() {
+    sortBtn.textContent = '排序：' + MODE_LABEL[mode];
+    sortBtn.title = '点击切换排序方式：默认顺序 → 按使用次数 → 按名称';
+    const used = DATA.items.filter(function (i) { return (i.u || 0) > 0; }).length;
+    sortHint.textContent = mode === 'usage' ? ('已记录 ' + used + ' 条') : '';
+  }
+
   function buildKeys(text) {
     const wrap = document.createElement('span');
     wrap.className = 'keys';
@@ -420,8 +494,7 @@ function buildHtml(
         sp.textContent = ' ';
         wrap.appendChild(sp);
       }
-      const parts = chord.split('+');
-      parts.forEach(function (p, pi) {
+      chord.split('+').forEach(function (p, pi) {
         if (pi > 0) {
           const plus = document.createElement('span');
           plus.className = 'plus';
@@ -442,7 +515,7 @@ function buildHtml(
     btn.className = 'row' + (it.a ? '' : ' missing');
     btn.disabled = !it.a;
     btn.dataset.command = it.c;
-    btn.title = it.c + (it.a ? '' : '（当前不可用）');
+    btn.title = it.c + (it.a ? '' : '（当前不可用）') + (it.u ? '   已使用 ' + it.u + ' 次' : '');
 
     const label = document.createElement('span');
     label.className = 'label';
@@ -521,6 +594,14 @@ function buildHtml(
     }
   });
 
+  // 点一下在三种排序间循环；真正生效要扩展侧重新排序并重绘
+  sortBtn.addEventListener('click', function () {
+    mode = MODES[(MODES.indexOf(mode) + 1) % MODES.length];
+    updateSortUi();
+    vscode.postMessage({ type: 'sort', mode: mode });
+  });
+
+  updateSortUi();
   render(DATA.items);
   q.focus();
 </script>
