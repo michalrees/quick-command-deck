@@ -151,3 +151,7 @@ cmd /c mklink /J "%USERPROFILE%\.vscode\extensions\<publisher>.quick-command-dec
 ## 许可
 
 MIT
+
+## 发布流程（不依赖 Azure 学生订阅）
+
+GitHub Actions 自动检查并打包，版本标签须与 package.json 一致。下载运行产物 `marketplace-vsix`，在 Marketplace 管理页执行 Update 上传；标签不再自动上架。也可本地运行 `node tools/prepare-release.cjs`。无需 Azure 订阅、PAT 或 Bitwarden。详细步骤见 [发布说明](AZURE-PUBLISHING.md)。
