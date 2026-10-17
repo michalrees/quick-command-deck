@@ -97,8 +97,8 @@ let inlineScript = null;
 if (fnIdx >= 0) {
   let buildHtml = null;
   try {
-    const body = src.slice(fnIdx).replace(/\/\/#\s*sourceMappingURL=.*$/m, '');
-    buildHtml = new Function('return ' + body)();
+    const body = src.slice(src.indexOf('function makePayload(')).replace(/\/\/#\s*sourceMappingURL=.*$/m, '');
+    buildHtml = new Function(body + '; return buildHtml;')();
   } catch (e) {
     bad('无法取出 buildHtml()：' + e.message);
   }
@@ -132,7 +132,7 @@ if (fnIdx >= 0) {
         }
 
         // ── 3. payload 必须逐字节还原 ──
-        const dm = inlineScript.match(/const DATA = (\{[\s\S]*?\});/);
+        const dm = inlineScript.match(/let DATA = (\{[\s\S]*?\});/);
         if (!dm) {
           bad('内联脚本里找不到 const DATA = {...}');
         } else {

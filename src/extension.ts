@@ -1,3 +1,4 @@
+import { parse, ParseError, printParseErrorCode } from 'jsonc-parser';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
@@ -14,6 +15,7 @@ type SortMode = 'default' | 'usage' | 'alpha' | 'source';
 
 export function activate(context: vscode.ExtensionContext): void {
   const provider = new CommandDeckViewProvider(context);
+  context.subscriptions.push(provider, vscode.extensions.onDidChange(() => provider.invalidate()));
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(VIEW_ID, provider, {
@@ -30,7 +32,8 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('quickCommandDeck.refresh', () => provider.refresh())
+    vscode.commands.registerCommand('quickCommandDeck.refresh', () => provider.invalidate()),
+    vscode.commands.registerCommand('quickCommandDeck.diagnose', () => provider.diagnose())
   );
 
   // ── 手动指定 keybindings.json ──────────────────────────────────────
@@ -109,6 +112,7 @@ interface DeckItem extends CommandItem {
   bare?: string;
   /** 累计点击执行次数（本扩展自己统计） */
   usage?: number;
+  order?: number;
 }
 
 interface DeckSettings {
@@ -124,8 +128,9 @@ interface DeckSettings {
 function readSettings(): DeckSettings {
   const cfg = vscode.workspace.getConfiguration('quickCommandDeck');
   const raw = cfg.get<CommandItem[]>('commands', []);
+  const fontSize = cfg.get<number>('fontSize', 14);
   return {
-    fontSize: cfg.get<number>('fontSize', 14),
+    fontSize: Number.isFinite(fontSize) ? Math.min(32, Math.max(9, fontSize)) : 14,
     showKeys: cfg.get<boolean>('showKeys', true),
     dense: cfg.get<boolean>('dense', false),
     includeExtensions: cfg.get<boolean>('includeExtensionCommands', true),
@@ -137,6 +142,10 @@ function readSettings(): DeckSettings {
 interface ExtensionContribution {
   key?: string;
   command?: string;
+  win?: string;
+  mac?: string;
+  linux?: string;
+  when?: string;
 }
 
 /** 命令 ID 形如 xxx.key.ctrl+right 的，是扩展用来转发按键的内部辅助命令 */
@@ -207,6 +216,7 @@ interface Contributions {
   extNames: Map<string, string>;
   /** 命令 ID → 用户自己在 keybindings.json 里绑的键位 */
   userKeys: Map<string, string>;
+  removedKeys: Map<string, Set<string>>;
 }
 
 /**
@@ -337,66 +347,13 @@ function describeKeybindings(r: ResolvedKeybindings): string {
   return r.origin === 'manual' ? '手动：' + base : base;
 }
 
-/** 去掉 JSONC 的注释与尾随逗号，使其能被 JSON.parse 处理 */
-function stripJsonComments(text: string): string {
-  let out = '';
-  let inString = false;
-  let inLine = false;
-  let inBlock = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    const next = text[i + 1];
-    if (inLine) {
-      if (ch === '\n') {
-        inLine = false;
-        out += ch;
-      }
-      continue;
-    }
-    if (inBlock) {
-      if (ch === '*' && next === '/') {
-        inBlock = false;
-        i++;
-      }
-      continue;
-    }
-    if (inString) {
-      out += ch;
-      if (ch === '\\') {
-        out += next ?? '';
-        i++;
-      } else if (ch === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      out += ch;
-      continue;
-    }
-    if (ch === '/' && next === '/') {
-      inLine = true;
-      i++;
-      continue;
-    }
-    if (ch === '/' && next === '*') {
-      inBlock = true;
-      i++;
-      continue;
-    }
-    out += ch;
-  }
-  // 尾随逗号
-  return out.replace(/,(\s*[}\]])/g, '$1');
-}
-
 interface UserKeybindingEntry {
   key?: string;
   command?: string;
   win?: string;
   mac?: string;
   linux?: string;
+  when?: string;
 }
 
 interface UserKeybindingRead {
@@ -404,6 +361,8 @@ interface UserKeybindingRead {
   map: Map<string, string>;
   /** 文件里的原始条目数（含解绑、平台覆盖、非法项） */
   entries: number;
+  removed: Map<string, Set<string>>;
+  conditional: number;
   /** 读/解析失败的原因；成功时为 undefined */
   error?: string;
 }
@@ -411,20 +370,24 @@ interface UserKeybindingRead {
 /** 读取用户 keybindings.json，得到「命令 ID → 用户绑定键位」 */
 function readUserKeybindings(file: string | null): UserKeybindingRead {
   const map = new Map<string, string>();
+  const removed = new Map<string, Set<string>>();
+  let conditional = 0;
   if (!file) {
-    return { map, entries: 0 };
+    return { map, removed, conditional, entries: 0 };
   }
   let entries: UserKeybindingEntry[];
   try {
-    const parsed = JSON.parse(stripJsonComments(fs.readFileSync(file, 'utf8')));
+    const errors: ParseError[] = [];
+    const parsed = parse(fs.readFileSync(file, 'utf8'), errors, { allowTrailingComma: true });
+    if (errors.length) { throw new Error(errors.map(e => `${printParseErrorCode(e.error)} @${e.offset}`).join(', ')); }
     if (!Array.isArray(parsed)) {
-      return { map, entries: 0, error: '文件顶层不是数组（keybindings.json 应该是一个 JSON 数组）' };
+      return { map, removed, conditional, entries: 0, error: '文件顶层不是数组（keybindings.json 应该是一个 JSON 数组）' };
     }
     entries = parsed as UserKeybindingEntry[];
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     console.warn('[quick-command-deck] 解析快捷键文件失败：' + file + ' —— ' + detail);
-    return { map, entries: 0, error: detail };
+    return { map, removed, conditional, entries: 0, error: detail };
   }
 
   const platformKey = process.platform === 'win32' ? 'win' : process.platform === 'darwin' ? 'mac' : 'linux';
@@ -432,17 +395,40 @@ function readUserKeybindings(file: string | null): UserKeybindingRead {
     if (!e || typeof e.command !== 'string' || typeof e.key !== 'string') {
       continue;
     }
-    // 负号是"解绑"，不是绑定
+    const override = e[platformKey as keyof UserKeybindingEntry];
+    const key = prettyKey(typeof override === 'string' ? override : e.key);
     if (e.command.startsWith('-')) {
+      const command = e.command.slice(1);
+      const keys = removed.get(command) ?? new Set<string>();
+      keys.add(key.toLowerCase() + (e.when ? ` [条件: ${e.when}]` : ''));
+      removed.set(command, keys);
       continue;
     }
-    const override = e[platformKey as keyof UserKeybindingEntry];
-    const key = typeof override === 'string' && override ? override : e.key;
-    if (!map.has(e.command)) {
-      map.set(e.command, prettyKey(key));
-    }
+    if (e.when) { conditional++; }
+    const display = key + (e.when ? ` [条件: ${e.when}]` : '');
+    // 保留多个条件绑定，不把静态文件提示冒充运行时生效键位。
+    const previous = map.get(e.command);
+    map.set(e.command, previous ? previous + ' / ' + display : display);
+
   }
-  return { map, entries: entries.length };
+  return { map, removed, conditional, entries: entries.length };
+}
+
+const userCache = new Map<string, { signature: string; value: UserKeybindingRead }>();
+const nlsCache = new Map<string, { signature: string; value: Array<Record<string, string>> }>();
+function fileSignature(file: string): string {
+  try { const st = fs.statSync(file); return `${st.mtimeMs}:${st.ctimeMs}:${st.size}`; }
+  catch { return 'missing'; }
+}
+function cachedUserKeybindings(file: string | null): UserKeybindingRead {
+  if (!file) { return readUserKeybindings(null); }
+  const signature = fileSignature(file);
+  const cached = userCache.get(file);
+  if (cached?.signature === signature) { return cached.value; }
+  const value = readUserKeybindings(file);
+  userCache.clear();
+  userCache.set(file, { signature, value });
+  return value;
 }
 
 /**
@@ -455,7 +441,8 @@ function collectContributions(context: vscode.ExtensionContext, keybindingsFile:
   const bareTitles = new Map<string, string>();
   const keys = new Map<string, string>();
   const extNames = new Map<string, string>();
-  const userKeys = readUserKeybindings(keybindingsFile).map;
+  const userRead = cachedUserKeybindings(keybindingsFile);
+  const userKeys = userRead.map;
 
   for (const ext of vscode.extensions.all) {
     const pkg = ext.packageJSON as
@@ -515,12 +502,14 @@ function collectContributions(context: vscode.ExtensionContext, keybindingsFile:
       // ★ 只收键位，不改归属：很多扩展会给"别人的/内置的"命令声明键位
       //   （如 GitLens 给 workbench.view.scm 声明键位），据此认领来源会误判
       if (!keys.has(kb.command)) {
-        keys.set(kb.command, prettyKey(kb.key));
+        const platform = process.platform === 'darwin' ? 'mac' : process.platform === 'win32' ? 'win' : 'linux';
+        const value = (kb as UserKeybindingEntry)[platform] ?? kb.key;
+        keys.set(kb.command, prettyKey(value) + (kb.when ? ` [条件: ${kb.when}]` : ''));
       }
     }
   }
 
-  return { owners, namespaces, bareTitles, keys, extNames, userKeys };
+  return { owners, namespaces, bareTitles, keys, extNames, userKeys, removedKeys: userRead.removed };
 }
 
 /** 标题里形如 %some.key% 的是扩展的本地化 key（未解析） */
@@ -534,6 +523,9 @@ const NLS_KEY = /%([a-zA-Z][a-zA-Z0-9_.]*)%/g;
  * 返回候选包列表：中文包优先，英文包兜底（有的 key 只在其中一边存在）。
  */
 function readNlsBundles(extRoot: string): Array<Record<string, string>> {
+  const signature = ['package.nls.zh-cn.json', 'package.nls.json'].map(f => fileSignature(path.join(extRoot, f))).join('|');
+  const cached = nlsCache.get(extRoot);
+  if (cached?.signature === signature) { return cached.value; }
   const out: Array<Record<string, string>> = [];
   for (const file of ['package.nls.zh-cn.json', 'package.nls.json']) {
     try {
@@ -549,6 +541,7 @@ function readNlsBundles(extRoot: string): Array<Record<string, string>> {
       /* 语言包损坏就跳过，退回可读化处理 */
     }
   }
+  nlsCache.set(extRoot, { signature, value: out });
   return out;
 }
 
@@ -603,7 +596,53 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
   /** 手动指定的快捷键文件出问题时只提示一次，避免每次 render 都弹 */
   private notifiedKeybindingsProblem = '';
 
+  private refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  private revision = 0;
+  private initialized = false;
+  private ready = false;
+  private lastData: object | undefined;
+  private usagePending: Promise<void> = Promise.resolve();
+  private watched = new Map<string, () => void>();
+  private contributions: { file: string | null; signature: string; value: Contributions } | undefined;
+  private messageSubscription: vscode.Disposable | undefined;
+  private viewSubscription: vscode.Disposable | undefined;
+  private allowed = new Set<string>();
+
   constructor(private readonly context: vscode.ExtensionContext) {}
+
+  public invalidate(): void {
+    this.contributions = undefined;
+    userCache.clear();
+    nlsCache.clear();
+    this.refresh();
+  }
+
+  public dispose(): void {
+    if (this.refreshTimer) { clearTimeout(this.refreshTimer); }
+    for (const [file, listener] of this.watched) { fs.unwatchFile(file, listener); }
+    this.watched.clear();
+    this.messageSubscription?.dispose();
+    this.viewSubscription?.dispose();
+    this.view = undefined;
+    this.revision++;
+  }
+
+  private watchKeybindings(file: string | null): void {
+    const candidates = new Set(autoKeybindingsCandidates(this.context).map(c => c.file));
+    const manual = normalizeUserPath(readSettings().keybindingsPath).file;
+    if (manual) { candidates.add(manual); }
+    if (file) { candidates.add(file); }
+    for (const [old, listener] of this.watched) {
+      if (!candidates.has(old)) { fs.unwatchFile(old, listener); this.watched.delete(old); }
+    }
+    for (const candidate of candidates) {
+      if (this.watched.has(candidate)) { continue; }
+      const listener = () => { this.contributions = undefined; this.refresh(); };
+      fs.watchFile(candidate, { persistent: false, interval: 1000 }, listener);
+      this.watched.set(candidate, listener);
+    }
+  }
+
 
   /** 手动指定的文件不存在/不合法时提醒一次（此时已回退自动探测） */
   private warnKeybindingsProblem(problem?: string): void {
@@ -615,18 +654,32 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
   }
 
   public resolveWebviewView(webviewView: vscode.WebviewView): void {
+    this.messageSubscription?.dispose();
+    this.viewSubscription?.dispose();
     this.view = webviewView;
+    this.initialized = false;
+    this.ready = false;
+    this.lastData = undefined;
+    this.viewSubscription = webviewView.onDidDispose(() => {
+      if (this.view === webviewView) { this.view = undefined; this.revision++; }
+    });
     webviewView.webview.options = { enableScripts: true };
 
-    webviewView.webview.onDidReceiveMessage(
+    this.messageSubscription = webviewView.webview.onDidReceiveMessage(
       async (msg: { type?: string; command?: string; mode?: string }) => {
+        if (msg?.type === 'ready') {
+          this.ready = true;
+          if (this.lastData) { await webviewView.webview.postMessage(this.lastData); }
+          return;
+        }
         if (msg?.type === 'sort' && msg.mode) {
           await this.setSortMode(msg.mode as SortMode);
           return;
         }
         const cmd = msg?.command;
         if ((msg?.type === 'execute' || msg?.type === 'run') && cmd) {
-          await this.bumpUsage(cmd);
+          if (typeof cmd !== 'string' || !this.allowed.has(cmd)) { return; }
+          void this.bumpUsage(cmd);
           try {
             await vscode.commands.executeCommand(cmd);
           } catch (err) {
@@ -638,11 +691,16 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
       }
     );
 
-    void this.render();
+    void this.render().catch(err => console.error('[quick-command-deck] render failed', err));
   }
 
   public refresh(): void {
-    void this.render();
+    this.revision++;
+    if (this.refreshTimer) { clearTimeout(this.refreshTimer); }
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = undefined;
+      void this.render().catch(err => console.error('[quick-command-deck] refresh failed', err));
+    }, 100);
   }
 
   private usageMap(): Record<string, number> {
@@ -655,21 +713,52 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async setSortMode(mode: SortMode): Promise<void> {
+    if (!['default', 'usage', 'alpha', 'source'].includes(mode)) { return; }
     await this.context.globalState.update(STATE_SORT, mode);
-    await this.render();
+    this.refresh();
   }
 
   /** 记一次点击；存 globalState，跨工作区累计 */
-  private async bumpUsage(command: string): Promise<void> {
-    const map = { ...this.usageMap() };
-    map[command] = (map[command] ?? 0) + 1;
-    await this.context.globalState.update(STATE_USAGE, map);
+  private bumpUsage(command: string): Promise<void> {
+    this.usagePending = this.usagePending.then(async () => {
+      const map = { ...this.usageMap() };
+      map[command] = (map[command] ?? 0) + 1;
+      await this.context.globalState.update(STATE_USAGE, map);
+      this.refresh();
+    }).catch(err => console.warn('[quick-command-deck] 保存点击统计失败', err));
+    return this.usagePending;
+  }
+
+  public async diagnose(): Promise<void> {
+    const settings = readSettings();
+    const kb = resolveKeybindingsFile(this.context, settings.keybindingsPath);
+    const read = cachedUserKeybindings(kb.file);
+    let registered: string[] = [];
+    let commandError = '';
+    try { registered = await vscode.commands.getCommands(true); } catch (err) { commandError = String(err); }
+    const con = collectContributions(this.context, kb.file);
+    const configured = settings.userCommands.length ? settings.userCommands : DEFAULT_COMMANDS;
+    const missing = configured.filter(it => it?.command && !registered.includes(it.command)).map(it => it.command);
+    const lines = ['Quick Command Deck 诊断',
+      `快捷键来源: ${kb.origin}`, `快捷键文件: ${kb.file ?? '未找到'}`,
+      `路径问题: ${kb.problem ?? '无'}`, `解析问题: ${read.error ?? '无'}`,
+      `记录数: ${read.entries}；绑定命令: ${read.map.size}；条件绑定: ${read.conditional}；解绑命令: ${read.removed.size}`,
+      `已注册命令: ${registered.length}${commandError ? '；查询失败: ' + commandError : ''}`,
+      `扩展声明命令: ${con.owners.size}；纳入扩展命令: ${settings.includeExtensions ? '是' : '否'}`,
+      `清单中尚未注册: ${missing.join('、') || '无'}`,
+      '键位来源优先级: 自定义清单显示值 > 用户绑定 > 扩展默认 > 内置提示。',
+      '条件绑定仅展示条件，不判断当前生效状态；命令注册也不代表当前上下文可执行。',
+      '扩展列表只收录扩展声明且具有键位的命令；同键位的不同命令均保留。'];
+    const doc = await vscode.workspace.openTextDocument({ content: lines.join('\n'), language: 'plaintext' });
+    await vscode.window.showTextDocument(doc, { preview: true });
   }
 
   private async render(): Promise<void> {
     if (!this.view) {
       return;
     }
+    const revision = ++this.revision;
+    const view = this.view;
     const { fontSize, showKeys, dense, includeExtensions, userCommands, keybindingsPath } = readSettings();
 
     let available: Set<string>;
@@ -679,6 +768,8 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
       available = new Set<string>();
     }
 
+    if (revision !== this.revision || this.view !== view) { return; }
+
     // 键位来源：手动指定的文件优先，其次是自动探测；出问题会提示一次并回退
     const kb = resolveKeybindingsFile(this.context, keybindingsPath);
     this.warnKeybindingsProblem(kb.problem);
@@ -687,12 +778,31 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
     }
     console.log(`[quick-command-deck] 快捷键文件：${kb.file ?? '（未找到）'}（${kb.origin}）`);
 
-    const con = collectContributions(this.context, kb.file);
+    this.watchKeybindings(kb.file);
+    const signature = kb.file ? fileSignature(kb.file) : 'none';
+    if (!this.contributions || this.contributions.file !== kb.file || this.contributions.signature !== signature) {
+      this.contributions = { file: kb.file, signature, value: collectContributions(this.context, kb.file) };
+    }
+    const con = this.contributions.value;
+    const read = cachedUserKeybindings(kb.file);
+    if (read.error) {
+      const problem = '快捷键解析失败：' + read.error;
+      if (problem !== this.notifiedKeybindingsProblem) {
+        this.notifiedKeybindingsProblem = problem;
+        void vscode.window.showWarningMessage('Quick Command Deck：' + problem);
+      }
+    }
     const usage = this.usageMap();
 
-    // 键位取值优先级：清单里显式写死的 > 用户自定义绑定 > 扩展声明的默认键位
-    const keyOf = (command: string, explicit?: string): string | undefined =>
-      explicit ? String(explicit) : con.userKeys.get(command) ?? con.keys.get(command);
+    // 用户清单显示值 > 用户绑定 > 扩展默认 > 内置提示。
+    const keyOf = (command: string, fallback?: string): string | undefined => {
+      const explicit = userCommands.find(it => it?.command === command)?.keys;
+      if (explicit !== undefined) { return String(explicit); }
+      if (con.userKeys.has(command)) { return con.userKeys.get(command); }
+      const key = con.keys.get(command) ?? fallback;
+      const removed = con.removedKeys.get(command);
+      return key && !removed?.has(key.toLowerCase()) && !removed?.has(key.split(' [条件:')[0].toLowerCase()) ? key : undefined;
+    };
 
     // 设置里的 commands 是任意 JSON，label/command 可能是 undefined 或非字符串，
     // 一律 String() 兜住，避免后续比较/排序抛异常
@@ -703,7 +813,7 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
         label: String(it.label ?? it.command),
         command: String(it.command),
         keys: keyOf(String(it.command), it.keys),
-        available: available.has(String(it.command))
+        available: available.has(String(it.command)) || con.owners.has(String(it.command))
       }));
 
     // ── 扩展命令：名字带"扩展显示名:"前缀，无正式标题则按 ID 可读化 ──
@@ -726,47 +836,20 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
           source,
           command: String(command),
           keys: keyOf(command),
-          // ★ 关键：不再要求"当前已注册"。
-          //   很多扩展是懒激活的（如 LaTeX Workshop 只在 onCommand/onWebviewPanel 时激活），
-          //   未激活时它的命令不在 getCommands() 里，但用户明明在 keybindings.json 里绑了它。
-          //   以前这里用 available.has() 过滤，导致这类命令永远不显示、也搜不到。
-          //   现在：有自定义绑定的一律可用；扩展声明的若尚未注册则标为"未激活"但仍列出，
-          //   点击时若确实执行不了会弹提示。
-          available: available.has(command) || con.userKeys.has(command)
+          // 扩展声明的命令允许点击以触发懒激活；执行失败由消息处理器报告。
+          available: true
         });
       }
       extras.sort((a, b) => String(a.label).localeCompare(String(b.label), 'zh-Hans-CN'));
     }
 
-    // ── 双向去重（内置清单优先）────────────────────────────────────────
-    // ① 命令 ID 相同 → 保留内置那条
-    // ② 键位相同 → 只保留第一个；但若某项是你"自定义绑定"的键位，则它优先，
-    //    已有的同键位条目让位（否则你把某命令绑到已被占用的键上时会看不到它）
+    // 键位可能因 when 条件而合法重复；仅按命令 ID 去重。
     const seenCommands = new Set<string>();
-    const seenKeys = new Map<string, number>();
-    const merged: DeckItem[] = [];
-    for (const it of [...curated, ...extras]) {
-      const cmd = String(it.command);
-      if (seenCommands.has(cmd)) {
-        continue;
-      }
-      const kb = it.keys ? String(it.keys) : '';
-      const norm = kb ? kb.toLowerCase().replace(/\s+/g, ' ').trim() : '';
-      const isUserBound = con.userKeys.has(cmd);
-      if (norm && seenKeys.has(norm) && !isUserBound) {
-        continue;
-      }
-      if (norm) {
-        const prevIdx = seenKeys.get(norm);
-        if (prevIdx !== undefined && isUserBound) {
-          merged.splice(prevIdx, 1); // 让位给你的自定义绑定
-          seenKeys.delete(norm);
-        }
-        seenKeys.set(norm, merged.length);
-      }
-      seenCommands.add(cmd);
-      merged.push(it);
-    }
+    const merged = [...curated, ...extras].filter(it => {
+      if (seenCommands.has(it.command)) { return false; }
+      seenCommands.add(it.command);
+      return true;
+    });
 
     // 给没有来源的条目补来源：按命名空间反查（VS Code 内置命令有 vscode.xxx 形式的归属）
     for (const it of merged) {
@@ -783,6 +866,7 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    merged.forEach((it, index) => { it.order = index; });
     for (const it of merged) {
       it.usage = usage[it.command] ?? 0;
     }
@@ -811,13 +895,15 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
     }
 
     try {
-      this.view.webview.html = buildHtml(merged, {
-        fontSize,
-        showKeys,
-        dense,
-        mode,
-        nonce: nonce()
-      });
+      this.allowed = new Set(merged.filter(it => it.available).map(it => it.command));
+      const options = { fontSize, showKeys, dense, mode, nonce: nonce() };
+      this.lastData = { type: 'data', ...makePayload(merged, options), fontSize, dense };
+      if (!this.initialized) {
+        this.initialized = true;
+        view.webview.html = buildHtml(merged, options);
+      } else if (this.ready) {
+        await view.webview.postMessage(this.lastData);
+      }
     } catch (err) {
       const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
       this.view.webview.html =
@@ -828,16 +914,10 @@ class CommandDeckViewProvider implements vscode.WebviewViewProvider {
   }
 }
 
-function buildHtml(
-  items: DeckItem[],
-  opts: { fontSize: number; showKeys: boolean; dense: boolean; mode: SortMode; nonce: string }
-): string {
-  // 这段 JSON 会被内联进 <script> 里，所以必须把 '<' 转义成 \u003c：
-  // 万一某个扩展的命令标题里带 "</script>"（或 "<!--"），HTML 解析器会提前
-  // 闭合脚本标签，整块脚本直接消失 —— 又是白屏。转义后 JS 解析出的字符串
-  // 与原文完全一致（\u003c 就是 '<'），只是不再能被 HTML 解析器看见。
-  const payload = JSON.stringify({
-    items: items.map((i) => ({
+function makePayload(items: DeckItem[], opts: { showKeys: boolean; mode: SortMode }) {
+  return {
+    items: items.map((i, index) => ({
+      o: i.order ?? index,
       n: String(i.label ?? ''),
       c: String(i.command ?? ''),
       k: i.keys === undefined || i.keys === null ? '' : String(i.keys),
@@ -847,7 +927,18 @@ function buildHtml(
     })),
     showKeys: !!opts.showKeys,
     sortMode: opts.mode
-  }).replace(/</g, '\\u003c');
+  };
+}
+
+function buildHtml(
+  items: DeckItem[],
+  opts: { fontSize: number; showKeys: boolean; dense: boolean; mode: SortMode; nonce: string }
+): string {
+  // 这段 JSON 会被内联进 <script> 里，所以必须把 '<' 转义成 \u003c：
+  // 万一某个扩展的命令标题里带 "</script>"（或 "<!--"），HTML 解析器会提前
+  // 闭合脚本标签，整块脚本直接消失 —— 又是白屏。转义后 JS 解析出的字符串
+  // 与原文完全一致（\u003c 就是 '<'），只是不再能被 HTML 解析器看见。
+  const payload = JSON.stringify(makePayload(items, opts)).replace(/</g, '\\u003c');
 
   const csp = [
     "default-src 'none'",
@@ -1036,8 +1127,8 @@ function buildHtml(
 
 <script nonce="${opts.nonce}">
   const vscode = acquireVsCodeApi();
-  const DATA = ${payload};
-  const SHOW_KEYS = ${opts.showKeys ? 'true' : 'false'};
+  let DATA = ${payload};
+  let SHOW_KEYS = ${opts.showKeys ? 'true' : 'false'};
 
   const MODES = ['default', 'usage', 'alpha', 'source'];
   const MODE_LABEL = {
@@ -1053,6 +1144,7 @@ function buildHtml(
   //    想统计按键只能把键位改指到扩展的转调命令上，属于可选改造，当前未实现。
   const CLICK_ONLY = '只统计在本面板里点击行的次数；用键盘快捷键执行的命令不计入（VS Code 未提供相关 API）';
   let mode = DATA.sortMode || 'default';
+  const saved = vscode.getState() || {};
 
   const q = document.getElementById('q');
   const list = document.getElementById('list');
@@ -1112,13 +1204,25 @@ function buildHtml(
   function setMode(m) {
     if (m === mode) return;
     mode = m;
+    DATA.items.sort(function (a, b) {
+      if (m === 'usage') return (b.u || 0) - (a.u || 0);
+      if (m === 'source') return (a.s || '').localeCompare(b.s || '') || a.n.localeCompare(b.n);
+      if (m === 'alpha') return a.n.localeCompare(b.n);
+      return (a.o || 0) - (b.o || 0);
+    });
     buildSortUi();
+    redraw();
     vscode.postMessage({ type: 'sort', mode: m });
   }
 
   function buildKeys(text) {
     const wrap = document.createElement('span');
     wrap.className = 'keys';
+    if (String(text).indexOf(' [条件:') >= 0 || String(text).indexOf(' / ') >= 0) {
+      wrap.textContent = text;
+      wrap.title = '文件中的绑定声明，条件是否满足由 VS Code 决定';
+      return wrap;
+    }
     const chords = String(text).split(' ');
     chords.forEach(function (chord, ci) {
       if (ci > 0) {
@@ -1203,6 +1307,7 @@ function buildHtml(
     rows.forEach(function (r, idx) { r.el.classList.toggle('sel', idx === sel); });
     const cur = rows[sel];
     if (cur) cur.el.scrollIntoView({ block: 'nearest' });
+    saveState();
   }
 
   // 归一化：小写 + 去掉加号周围空白 + 压掉所有空白。
@@ -1231,10 +1336,34 @@ function buildHtml(
   }
 
   function redraw() {
+    const command = rows[sel] && rows[sel].item.c;
+    const scroll = list.scrollTop;
     updateClearBtn();
     updateHint();
     render(currentList(), mode === 'source' && !q.value.trim());
+    const index = rows.findIndex(function (r) { return r.item.c === command; });
+    if (index >= 0) select(index);
+    list.scrollTop = scroll;
+    saveState();
   }
+
+  function saveState() {
+    vscode.setState({ query: q.value, scroll: list.scrollTop, selected: rows[sel] && rows[sel].item.c });
+  }
+  list.addEventListener('scroll', saveState);
+  window.addEventListener('message', function (event) {
+    const data = event.data;
+    if (!data || data.type !== 'data' || !Array.isArray(data.items)) return;
+    DATA = data;
+    SHOW_KEYS = data.showKeys;
+    mode = data.sortMode;
+    document.documentElement.style.setProperty('--deck-font', data.fontSize + 'px');
+    document.documentElement.style.setProperty('--deck-rowgap', data.dense ? '1px' : '2px');
+    document.documentElement.style.setProperty('--deck-pady', data.dense ? '3px' : '5px');
+    document.documentElement.style.setProperty('--deck-padx', data.dense ? '8px' : '10px');
+    buildSortUi();
+    redraw();
+  });
 
   q.addEventListener('input', redraw);
   sortSel.addEventListener('change', function () { setMode(sortSel.value); });
@@ -1284,8 +1413,14 @@ function buildHtml(
     if (!DATA || !Array.isArray(DATA.items)) {
       throw new Error('payload 异常：items 不是数组（' + JSON.stringify(DATA).slice(0, 120) + '）');
     }
+    q.value = typeof saved.query === 'string' ? saved.query : '';
     buildSortUi();
     redraw();
+    const restored = rows.findIndex(function (r) { return r.item.c === saved.selected; });
+    if (restored >= 0) select(restored);
+    list.scrollTop = saved.scroll || 0;
+    saveState();
+    vscode.postMessage({ type: 'ready' });
     q.focus();
   } catch (err) {
     showFatal(String((err && err.stack) || err));

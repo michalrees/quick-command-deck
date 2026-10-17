@@ -4,4 +4,10 @@ src/**
 tools/**
 tsconfig.json
 **/*.map
-node_modules/**
+
+.github/**
+azure-pipelines.yml
+AZURE-PUBLISHING.md
+MARKETPLACE-RELEASE.json
+*.vsix
+*.vsix.sha256

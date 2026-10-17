@@ -2,7 +2,7 @@
   "name": "quick-command-deck",
   "displayName": "Quick Command Deck",
   "description": "把常用命令做成按钮，放在右侧辅助侧边栏（或左侧栏）；点击即直接执行真实命令，不依赖模拟按键。",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "YuHaoran251",
   "license": "MIT",
   "engines": {
@@ -49,6 +49,11 @@
       {
         "command": "quickCommandDeck.resetKeybindingsFile",
         "title": "恢复自动探测快捷键文件",
+        "category": "Quick Command Deck"
+      },
+      {
+        "command": "quickCommandDeck.diagnose",
+        "title": "一键诊断",
         "category": "Quick Command Deck"
       }
     ],
@@ -142,7 +147,7 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "check": "npm run compile && node tools/check-webview.js",
+    "check": "npm run compile && node tools/check-webview.js && node tools/check-behavior.js",
     "release": "pwsh -NoProfile -File tools/release.ps1",
     "release:dry": "pwsh -NoProfile -File tools/release.ps1 -DryRun",
     "package": "vsce package"
@@ -151,5 +156,8 @@
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.75.0",
     "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "jsonc-parser": "^3.3.1"
   }
 }
