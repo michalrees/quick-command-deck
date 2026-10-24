@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0 — 2026-10-24
+
+- Add a VS Code status bar shortcut to open the command deck.
+
 ## 0.2.1 — 2026-10-17
 
 - Preserve search, selection and scroll position when refreshing command data.

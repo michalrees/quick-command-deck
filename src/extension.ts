@@ -31,6 +31,14 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
+  const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  statusBarItem.name = 'Quick Command Deck';
+  statusBarItem.text = '$(list-unordered) Command Deck';
+  statusBarItem.tooltip = '打开 Quick Command Deck';
+  statusBarItem.command = 'quickCommandDeck.open';
+  statusBarItem.show();
+  context.subscriptions.push(statusBarItem);
+
   context.subscriptions.push(
     vscode.commands.registerCommand('quickCommandDeck.refresh', () => provider.invalidate()),
     vscode.commands.registerCommand('quickCommandDeck.diagnose', () => provider.diagnose())

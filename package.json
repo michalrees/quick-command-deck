@@ -1,8 +1,8 @@
 {
   "name": "quick-command-deck",
   "displayName": "Quick Command Deck",
-  "description": "把常用命令做成按钮，放在右侧辅助侧边栏（或左侧栏）；点击即直接执行真实命令，不依赖模拟按键。",
-  "version": "0.2.1",
+  "description": "把常用命令做成按钮，放在 VS Code 状态栏和辅助侧边栏；点击即直接执行真实命令。",
+  "version": "0.3.0",
   "publisher": "YuHaoran251",
   "license": "MIT",
   "engines": {
@@ -15,6 +15,7 @@
     "commands",
     "sidebar",
     "auxiliary bar",
+    "status bar",
     "shortcuts",
     "productivity"
   ],
@@ -26,7 +27,8 @@
   "main": "./out/extension.js",
   "activationEvents": [
     "onView:quickCommandDeck.view",
-    "onCommand:quickCommandDeck.open"
+    "onCommand:quickCommandDeck.open",
+    "onStartupFinished"
   ],
   "contributes": {
     "commands": [
